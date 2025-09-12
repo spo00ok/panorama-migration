@@ -9,15 +9,6 @@ LOG_FILE = "../logs/object_duplication.log"
 # Backup original config
 shutil.copy(CONFIG_FILE, CONFIG_FILE + ".bak")
 
-#!/usr/bin/env python3
-import ipaddress
-import re
-import os
-
-CONFIG_FILE = "panorama.set"
-TRANSLATION_FILE = "translation.input"
-LOG_FILE = "duplicate_address_objects.log"
-
 translation = {}
 
 def load_translation():
