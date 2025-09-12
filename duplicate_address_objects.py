@@ -73,6 +73,7 @@ with open(CONFIG_FILE, "r") as infile, open(LOG_FILE, "a") as log:
             if parts[1] == "device-group":
                 dg = parts[2]
                 name = parts[4]
+                # everything after the name is optional (field, value, description, etc.)
                 field = parts[5] if len(parts) > 5 else None
                 value = parts[6] if len(parts) > 6 else None
             else:  # shared scope
@@ -81,13 +82,13 @@ with open(CONFIG_FILE, "r") as infile, open(LOG_FILE, "a") as log:
                 field = parts[3] if len(parts) > 3 else None
                 value = parts[4] if len(parts) > 4 else None
 
-            # Only act on real address values (ip-netmask, ip-range, fqdn)
+            # ✅ Only act if field is ip-netmask/ip-range/fqdn
             if field in ["ip-netmask", "ip-range", "fqdn"] and value:
                 t = translate_value(value)
                 if t:
                     new_name = name + "_pdc"
                     if (dg, new_name) not in created_pdc:
-                        # Create a duplicate object in the SAME DG
+                        # Create duplicate object in the SAME DG
                         if dg == "shared":
                             new_line = f"set shared address {new_name} {field} {t}\n"
                         else:
@@ -99,7 +100,7 @@ with open(CONFIG_FILE, "r") as infile, open(LOG_FILE, "a") as log:
 
                         created_pdc.add((dg, new_name))
                         continue
-
+                        
         # Update rule references
         m = rule_pattern.match(stripped)
         if m:
