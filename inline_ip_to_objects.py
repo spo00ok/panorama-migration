@@ -1,88 +1,144 @@
+#!/usr/bin/env python3
+import ipaddress
 import re
-import shutil
+import os
 
-CONFIG_FILE = "../panorama.set"
-LOG_FILE = "../logs/inline_ip_conversion.log"
+CONFIG_FILE = "panorama.set"
+TRANSLATION_FILE = "translation.input"
+LOG_FILE = "translate_inline_ips.log"
 
-shutil.copy(CONFIG_FILE, CONFIG_FILE + ".bak")
+# -------------------------------------------------------------------
+# Load translation mappings (IPs + subnets) from translation.input
+# -------------------------------------------------------------------
+translation = {}
 
-rule_pattern = re.compile(r"^set (device-group \S+|shared) rulebase security rules (\S+) (.+)$")
-ip_pattern = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
-subnet_pattern = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}/\d{1,2}$")
-range_pattern = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}-\d{1,3}(?:\.\d{1,3}){3}$")
+def load_translation():
+    with open(TRANSLATION_FILE, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or "," not in line:
+                continue
+            orig_str, new_str = line.split(",")
+            orig_net = ipaddress.ip_network(orig_str.strip(), strict=False)
+            new_net = ipaddress.ip_network(new_str.strip(), strict=False)
+            translation[str(orig_net)] = str(new_net)
 
-existing_objects = {}
+# -------------------------------------------------------------------
+# Translate an IP, subnet, or range
+# - Single IP: 1:1 priority, then subnet mapping
+# - Subnet: exact network or subnet-of mapping
+# - Range: endpoints mapped individually
+# -------------------------------------------------------------------
+def translate_value(value):
+    value = value.strip()
 
-with open(CONFIG_FILE, "r") as infile:
-    for line in infile:
-        if " address " in line and not "address-group" in line:
-            parts = line.split()
-            dg = "shared" if parts[1] == "address" else parts[2]
-            name = parts[2] if dg == "shared" else parts[3]
-            value = parts[-1].strip()
-            existing_objects[value] = name
+    # Try IP or subnet
+    try:
+        ip_net = ipaddress.ip_network(value, strict=False)
 
-with open(LOG_FILE, "w") as log:
-    log.write("=== Inline IP/Subnet/Range Conversion Log ===\n")
+        # 1:1 priority
+        for net_str, new_str in translation.items():
+            if str(ip_net) == net_str:
+                return new_str if "/" in new_str else str(ipaddress.ip_network(new_str, strict=False).network_address)
 
-def unique(seq):
-    seen, result = set(), []
-    for x in seq:
-        if x not in seen:
-            seen.add(x)
-            result.append(x)
-    return result
+        # Single IP (/32) inside a translated subnet
+        if ip_net.prefixlen == 32:
+            ip = ip_net.network_address
+            for net_str, new_str in translation.items():
+                net = ipaddress.ip_network(net_str, strict=False)
+                new_net = ipaddress.ip_network(new_str, strict=False)
+                if ip in net:
+                    offset = int(ip) - int(net.network_address)
+                    mapped_ip = ipaddress.ip_address(int(new_net.network_address) + offset)
+                    return str(mapped_ip)
 
-def normalize_name(value: str) -> str:
-    return "ADDR_" + value.replace(".", "_").replace("/", "_").replace("-", "_")
+        # Subnet inside a translated subnet
+        for net_str, new_str in translation.items():
+            net = ipaddress.ip_network(net_str, strict=False)
+            new_net = ipaddress.ip_network(new_str, strict=False)
+            if ip_net.subnet_of(net):
+                offset = int(ip_net.network_address) - int(net.network_address)
+                mapped_base = ipaddress.ip_address(int(new_net.network_address) + offset)
+                return str(ipaddress.ip_network(f"{mapped_base}/{ip_net.prefixlen}", strict=False))
 
-output_lines = []
-new_objects = set()
+    except ValueError:
+        pass
 
-def replace_tokens(entries, dg, rule_name, field, log):
-    new_tokens = []
-    for token in entries:
-        if ip_pattern.match(token) or subnet_pattern.match(token) or range_pattern.match(token):
-            if token in existing_objects:
-                obj_name = existing_objects[token]
-            else:
-                obj_name = normalize_name(token)
-                existing_objects[token] = obj_name
-                if (dg, obj_name) not in new_objects:
-                    if dg == "shared":
-                        obj_line = f"set shared address {obj_name} ip-netmask {token}\n"
-                    else:
-                        obj_line = f"set device-group {dg} address {obj_name} ip-netmask {token}\n"
-                    output_lines.append(obj_line)
-                    log.write(f"Created object {obj_name} = {token} in {dg}\n")
-                    new_objects.add((dg, obj_name))
-            if obj_name not in new_tokens:
-                new_tokens.append(obj_name)
-                log.write(f"Rule {rule_name} ({field}): {token} -> {obj_name}\n")
-        else:
-            new_tokens.append(token)
-    return new_tokens
+    # Try range
+    if "-" in value:
+        try:
+            start_ip, end_ip = value.split("-")
+            start_ip = ipaddress.ip_address(start_ip.strip())
+            end_ip = ipaddress.ip_address(end_ip.strip())
 
-with open(CONFIG_FILE, "r") as infile, open(LOG_FILE, "a") as log:
-    for line in infile:
-        stripped = line.strip()
-        m = rule_pattern.match(stripped)
-        if m:
-            dg_scope, rule_name, remainder = m.groups()
-            dg = dg_scope.split()[1] if dg_scope.startswith("device-group") else "shared"
-            new_remainder = remainder
-            for field in ["source", "destination"]:
-                if f"{field} " in new_remainder:
-                    pattern = re.compile(rf"{field}(?:\s+\[([^\]]+)\]| ([^\s]+))")
-                    mm = pattern.search(new_remainder)
-                    if mm:
-                        entries = mm.group(1).split() if mm.group(1) else [mm.group(2)]
-                        new_entries = replace_tokens(entries, dg, rule_name, field, log)
-                        new_entries = unique(new_entries)
-                        new_remainder = pattern.sub(f"{field} [ {' '.join(new_entries)} ]", new_remainder)
-            output_lines.append(f"set {dg_scope} rulebase security rules {rule_name} {new_remainder}\n")
-        else:
+            new_start, new_end = None, None
+            for net_str, new_str in translation.items():
+                net = ipaddress.ip_network(net_str, strict=False)
+                new_net = ipaddress.ip_network(new_str, strict=False)
+
+                if start_ip in net:
+                    offset = int(start_ip) - int(net.network_address)
+                    new_start = ipaddress.ip_address(int(new_net.network_address) + offset)
+                if end_ip in net:
+                    offset = int(end_ip) - int(net.network_address)
+                    new_end = ipaddress.ip_address(int(new_net.network_address) + offset)
+
+            if new_start and new_end:
+                return f"{new_start}-{new_end}"
+        except Exception:
+            return None
+
+    return None
+
+# -------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------
+def main():
+    if not os.path.exists(CONFIG_FILE):
+        print(f"Config file {CONFIG_FILE} not found.")
+        return
+    if not os.path.exists(TRANSLATION_FILE):
+        print(f"Translation file {TRANSLATION_FILE} not found.")
+        return
+
+    load_translation()
+
+    with open(CONFIG_FILE, "r") as f:
+        lines = f.readlines()
+
+    output_lines = []
+
+    with open(LOG_FILE, "w") as log:
+        for line in lines:
+            stripped = line.strip()
+
+            # Only process inline IPs in security rules
+            if re.match(r"^set (device-group \S+|shared) pre-rulebase security rules ", stripped):
+                parts = stripped.split()
+                new_parts = []
+                modified = False
+
+                for token in parts:
+                    if re.match(r"^\d+\.\d+\.\d+\.\d+(?:/\d+)?$", token) or "-" in token:
+                        new_val = translate_value(token)
+                        if new_val and new_val not in parts:
+                            new_parts.append(token)
+                            new_parts.append(new_val)
+                            log.write(f"Translated inline {token} -> {new_val}\n")
+                            modified = True
+                            continue
+                    new_parts.append(token)
+
+                if modified:
+                    line = " ".join(new_parts) + "\n"
+
             output_lines.append(line)
 
-with open(CONFIG_FILE, "w") as outfile:
-    outfile.writelines(output_lines)
+    with open(CONFIG_FILE, "w") as f:
+        f.writelines(output_lines)
+
+    print(f"Processing complete. Updated config written to {CONFIG_FILE}")
+    print(f"Log written to {LOG_FILE}")
+
+if __name__ == "__main__":
+    main()
