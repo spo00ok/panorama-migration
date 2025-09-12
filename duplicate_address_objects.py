@@ -66,14 +66,13 @@ with open(CONFIG_FILE, "r") as infile, open(LOG_FILE, "a") as log:
     for line in infile:
         stripped = line.strip()
 
-        # Duplicate address objects
+        # 🔹 Handle ALL address objects (shared + device-group)
         if re.match(r"^set (device-group \S+|shared) address ", stripped):
             parts = stripped.split()
 
             if parts[1] == "device-group":
                 dg = parts[2]
                 name = parts[4]
-                # everything after the name is optional (field, value, description, etc.)
                 field = parts[5] if len(parts) > 5 else None
                 value = parts[6] if len(parts) > 6 else None
             else:  # shared scope
@@ -82,26 +81,26 @@ with open(CONFIG_FILE, "r") as infile, open(LOG_FILE, "a") as log:
                 field = parts[3] if len(parts) > 3 else None
                 value = parts[4] if len(parts) > 4 else None
 
-            # ✅ Only act if field is ip-netmask/ip-range/fqdn
+            # ✅ Only duplicate if we’re looking at a real value (not description/tag)
             if field in ["ip-netmask", "ip-range", "fqdn"] and value:
                 t = translate_value(value)
                 if t:
                     new_name = name + "_pdc"
                     if (dg, new_name) not in created_pdc:
-                        # Create duplicate object in the SAME DG
+                        # Duplicate object in SAME DG
                         if dg == "shared":
                             new_line = f"set shared address {new_name} {field} {t}\n"
                         else:
                             new_line = f"set device-group {dg} address {new_name} {field} {t}\n"
 
                         output_lines.append(line)          # keep original
-                        output_lines.append(new_line)      # add new
+                        output_lines.append(new_line)      # add duplicate
                         log.write(f"{dg}:{name} {value} -> {new_name} {t}\n")
 
                         created_pdc.add((dg, new_name))
                         continue
-                        
-        # Update rule references
+
+        # 🔹 Update rule references
         m = rule_pattern.match(stripped)
         if m:
             dg_scope, rule_name, remainder = m.groups()
