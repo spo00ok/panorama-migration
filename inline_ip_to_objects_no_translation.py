@@ -31,11 +31,16 @@ def main():
         lines = f.readlines()
 
     # Collect existing address objects (value -> name)
+    # Collect existing address objects (value -> name)
     existing_objects = {}
     for l in lines:
         # only scan actual address object definitions, skip groups
         if re.match(r"^set (device-group \S+|shared) address ", l) and "address-group" not in l:
             parts = l.split()
+            # skip if the line is incomplete (for example just "... address")
+            if len(parts) < 6:   # need at least dg + 'address' + name + field + value
+                continue
+
             if parts[1] == "device-group":
                 dg = parts[2]
                 name = parts[4]
@@ -46,6 +51,8 @@ def main():
                 name = parts[2]
                 field = parts[3] if len(parts) > 3 else None
                 val = " ".join(parts[4:]) if len(parts) > 4 else None
+
+            # Only record real IP-based objects
             if field in ["ip-netmask", "ip-range"] and val:
                 existing_objects[val.strip()] = name
 
