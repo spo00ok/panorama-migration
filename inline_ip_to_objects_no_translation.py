@@ -30,10 +30,11 @@ def main():
     with open(CONFIG_FILE, "r") as f:
         lines = f.readlines()
 
-    # Collect already-defined address objects (value -> name)
+    # Collect existing address objects (value -> name)
     existing_objects = {}
     for l in lines:
-        if " address " in l and not "address-group" in l:
+        # only scan actual address object definitions, skip groups
+        if re.match(r"^set (device-group \S+|shared) address ", l) and "address-group" not in l:
             parts = l.split()
             if parts[1] == "device-group":
                 dg = parts[2]
@@ -57,17 +58,17 @@ def main():
         for line in lines:
             stripped = line.strip()
 
-            # Security rule with potential inline IPs/subnets/ranges
+            # ✅ Only process security rule lines
             if re.match(r"^set (device-group \S+|shared) pre-rulebase security rules ", stripped):
                 parts = stripped.split()
                 dg = parts[2] if parts[1] == "device-group" else "shared"
                 rule_name = parts[5]  # after 'rules'
                 new_parts = []
                 for token in parts:
-                    # Only handle literal inline IPs / subnets / ranges
+                    # Only convert literal inline IPs / subnets / ranges
                     if (re.match(r"^\d+\.\d+\.\d+\.\d+(?:/\d+)?$", token) or "-" in token) \
                         and not re.search("[a-zA-Z]", token):
-                        val = token   # no translation — keep as-is
+                        val = token   # no translation — keep original value
                         if val in existing_objects:
                             obj_name = existing_objects[val]
                         else:
@@ -85,8 +86,10 @@ def main():
                     else:
                         new_parts.append(token)
                 line = " ".join(new_parts) + "\n"
+            # All other lines (non-rule) remain untouched
             output_lines.append(line)
 
+    # 🔹 Rewrite the same config file in place
     with open(CONFIG_FILE, "w") as f:
         f.writelines(output_lines)
 
