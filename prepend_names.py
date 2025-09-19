@@ -11,15 +11,17 @@ def main():
         print(f"Config file {CONFIG_FILE} not found.")
         return
 
-    # 🔹 Always make a backup first
+    # 🔹 Backup the config before editing
     shutil.copy(CONFIG_FILE, CONFIG_FILE + ".bak")
 
-    # Use UTF-8 and be forgiving of stray bytes
+    # Read config using UTF-8 and replace any invalid bytes
     with open(CONFIG_FILE, "r", encoding="utf-8", errors="replace") as f:
         lines = f.readlines()
 
+    # ------------------------------------------------------------------
+    # 1️⃣ Collect address object / address-group names for renaming
+    # ------------------------------------------------------------------
     rename_map = {}
-    # --- Collect address object / address-group names only ---
     for l in lines:
         m = re.match(
             r'^set (device-group\s+\S+|shared)\s+(address|address-group)\s+(".*?"|\S+)\s+',
@@ -30,10 +32,10 @@ def main():
             if obj_name.startswith('"'):
                 inner = obj_name.strip('"')
                 if not inner.startswith("svb_host_"):
-                    rename_map[inner] = 'svb_host_' + inner
+                    rename_map[inner] = "svb_host_" + inner
             else:
                 if not obj_name.startswith("svb_host_"):
-                    rename_map[obj_name] = 'svb_host_' + obj_name
+                    rename_map[obj_name] = "svb_host_" + obj_name
 
     output_lines = []
     with open(LOG_FILE, "w", encoding="utf-8", errors="replace") as log:
@@ -43,7 +45,9 @@ def main():
             stripped = line.strip()
             old_line = line
 
-            # --- Rename only the definitions themselves ---
+            # ------------------------------------------------------------------
+            # 2️⃣ Rename address/address-group definitions themselves
+            # ------------------------------------------------------------------
             m = re.match(
                 r'^set (device-group\s+\S+|shared)\s+(address|address-group)\s+(".*?"|\S+)\s+(.*)',
                 stripped
@@ -66,32 +70,53 @@ def main():
                                   f"  NEW: {line.rstrip()}\n\n")
 
             else:
-                # --- Update references inside rules, but skip the rule name itself ---
-                if re.match(
-                    r'^set (device-group \S+|shared) (pre|post)-rulebase (security|application-override) rules ',
+                # ------------------------------------------------------------------
+                # 3️⃣ Update references in security or application-override rules
+                #     – handles quoted rule names and [ ... ] lists
+                # ------------------------------------------------------------------
+                m_rule = re.match(
+                    r'^set (device-group\s+\S+|shared)\s+(pre|post)-rulebase (security|application-override) rules ("[^"]+"|\S+)\s+(.*)$',
                     stripped
-                ):
-                    tokens = line.split()
-                    changed = False
-                    # tokens[0..6] include: set device-group <DG>|shared pre|post-rulebase <type> rules <RuleName>
-                    for i, t in enumerate(tokens):
-                        if i <= 6:  # skip up to and including rule name
-                            continue
-                        clean = t.strip('"')
-                        if clean in rename_map:
-                            if t.startswith('"'):
-                                tokens[i] = '"' + rename_map[clean] + '"'
+                )
+                if m_rule:
+                    rule_prefix = f"set {m_rule.group(1)} {m_rule.group(2)}-rulebase {m_rule.group(3)} rules {m_rule.group(4)} "
+                    remainder = m_rule.group(5)
+
+                    # Prefix names inside square brackets if found
+                    def replace_inside_brackets(match):
+                        inner = match.group(1)
+                        tokens = inner.split()
+                        out_tokens = []
+                        for tok in tokens:
+                            clean = tok.strip('"')
+                            if clean in rename_map:
+                                if tok.startswith('"'):
+                                    out_tokens.append('"' + rename_map[clean] + '"')
+                                else:
+                                    out_tokens.append(rename_map[clean])
                             else:
-                                tokens[i] = rename_map[clean]
-                            changed = True
-                    if changed:
-                        line = " ".join(tokens) + "\n"
-                        log.write(f"UPDATED REFERENCE:\n  OLD: {old_line.rstrip()}\n"
-                                  f"  NEW: {line.rstrip()}\n\n")
+                                out_tokens.append(tok)
+                        return "[" + " ".join(out_tokens) + "]"
+
+                    remainder = re.sub(r'\[([^\]]+)\]', replace_inside_brackets, remainder)
+
+                    # Also prefix any single unbracketed tokens
+                    def replace_single(match):
+                        tok = match.group(0)
+                        clean = tok.strip('"')
+                        if clean in rename_map:
+                            return '"' + rename_map[clean] + '"' if tok.startswith('"') else rename_map[clean]
+                        return tok
+
+                    remainder = re.sub(r'(".*?"|\S+)', replace_single, remainder)
+
+                    line = rule_prefix + remainder + "\n"
+                    log.write(f"UPDATED REFERENCE:\n  OLD: {old_line.rstrip()}\n"
+                              f"  NEW: {line.rstrip()}\n\n")
 
             output_lines.append(line)
 
-    # 🔹 Write the updated file back with UTF-8
+    # 🔹 Write updated configuration back to the same file
     with open(CONFIG_FILE, "w", encoding="utf-8", errors="replace") as f:
         f.writelines(output_lines)
 
