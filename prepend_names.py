@@ -11,13 +11,15 @@ def main():
         print(f"Config file {CONFIG_FILE} not found.")
         return
 
+    # 🔹 Always make a backup first
     shutil.copy(CONFIG_FILE, CONFIG_FILE + ".bak")
 
-    with open(CONFIG_FILE, "r") as f:
+    # Use UTF-8 and be forgiving of stray bytes
+    with open(CONFIG_FILE, "r", encoding="utf-8", errors="replace") as f:
         lines = f.readlines()
 
     rename_map = {}
-    # 1️⃣ Collect address object / address-group names only
+    # --- Collect address object / address-group names only ---
     for l in lines:
         m = re.match(
             r'^set (device-group\s+\S+|shared)\s+(address|address-group)\s+(".*?"|\S+)\s+',
@@ -25,7 +27,6 @@ def main():
         )
         if m:
             obj_name = m.group(3)
-            # handle quoted or unquoted names
             if obj_name.startswith('"'):
                 inner = obj_name.strip('"')
                 if not inner.startswith("svb_host_"):
@@ -35,14 +36,14 @@ def main():
                     rename_map[obj_name] = 'svb_host_' + obj_name
 
     output_lines = []
-    with open(LOG_FILE, "w") as log:
+    with open(LOG_FILE, "w", encoding="utf-8", errors="replace") as log:
         log.write("=== Prepend 'svb_host_' to Object Names and References Log ===\n\n")
 
         for line in lines:
             stripped = line.strip()
             old_line = line
 
-            # 2️⃣ Rename only the definitions themselves
+            # --- Rename only the definitions themselves ---
             m = re.match(
                 r'^set (device-group\s+\S+|shared)\s+(address|address-group)\s+(".*?"|\S+)\s+(.*)',
                 stripped
@@ -65,22 +66,19 @@ def main():
                                   f"  NEW: {line.rstrip()}\n\n")
 
             else:
-                # 3️⃣ Update references inside rules BUT NOT the rule name itself
+                # --- Update references inside rules, but skip the rule name itself ---
                 if re.match(
                     r'^set (device-group \S+|shared) (pre|post)-rulebase (security|application-override) rules ',
                     stripped
                 ):
                     tokens = line.split()
                     changed = False
-                    # tokens[0..4] are: set device-group <DG>|shared pre|post-rulebase <type> rules <RuleName>
-                    # Skip token for <RuleName> (index 6)
+                    # tokens[0..6] include: set device-group <DG>|shared pre|post-rulebase <type> rules <RuleName>
                     for i, t in enumerate(tokens):
-                        if i <= 6:  # up to and including the rule name token
+                        if i <= 6:  # skip up to and including rule name
                             continue
-                        # match unquoted object name references only
                         clean = t.strip('"')
                         if clean in rename_map:
-                            # preserve quotes if present
                             if t.startswith('"'):
                                 tokens[i] = '"' + rename_map[clean] + '"'
                             else:
@@ -93,13 +91,12 @@ def main():
 
             output_lines.append(line)
 
-    with open(CONFIG_FILE, "w") as f:
+    # 🔹 Write the updated file back with UTF-8
+    with open(CONFIG_FILE, "w", encoding="utf-8", errors="replace") as f:
         f.writelines(output_lines)
 
     print(f"✅ Updated {CONFIG_FILE} in place (backup saved as {CONFIG_FILE}.bak)")
     print(f"✅ Log of changes written to {LOG_FILE}")
 
 if __name__ == "__main__":
-    main()
-
     main()
