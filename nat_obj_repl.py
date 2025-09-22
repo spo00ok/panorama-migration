@@ -4,36 +4,30 @@ import re
 import ipaddress
 import shutil
 
-CONFIG_FILE      = "panorama.set"       # Panorama config in set-command format
-TRANSLATION_FILE = "translation.input"  # old,new mappings
+CONFIG_FILE      = "panorama.set"
+TRANSLATION_FILE = "translation.input"
 LOG_FILE         = "replace_nat_address_objects_with_translated.log"
 
 def load_translation():
-    """
-    Load translation mappings, giving priority to exact IP matches.
-    """
-    one_to_one = {}   # single IP -> translated IP
-    networks   = []   # (ip_network, translated net)
-    ranges     = []   # (start_ip, end_ip, translated range)
+    one_to_one = {}
+    networks   = []
+    ranges     = []
     with open(TRANSLATION_FILE, "r", encoding="utf-8", errors="replace") as f:
         for raw in f:
             raw = raw.strip()
             if not raw or "," not in raw:
                 continue
             orig, new = [p.strip() for p in raw.split(",",1)]
-            if "-" in orig and not "/" in orig:  # range
+            if "-" in orig and not "/" in orig:   # range
                 start, end = [ipaddress.ip_address(p) for p in orig.split("-")]
                 ranges.append((start, end, new))
-            elif "/" in orig:                    # subnet
+            elif "/" in orig:                     # subnet
                 networks.append((ipaddress.ip_network(orig, strict=False), new))
-            else:                                # single IP
+            else:                                 # single IP
                 one_to_one[orig] = new
     return one_to_one, networks, ranges
 
 def translated_value(ip_str, one_to_one, networks, ranges):
-    """
-    If ip_str matches a translation rule, return the translated value; else None.
-    """
     if ip_str in one_to_one:
         return one_to_one[ip_str]
     try:
@@ -60,9 +54,7 @@ def main():
     with open(CONFIG_FILE, "r", encoding="utf-8", errors="replace") as f:
         lines = f.readlines()
 
-    # ------------------------------------------------------------------
-    # Build a lookup: address object name -> its IP/subnet/range value
-    # ------------------------------------------------------------------
+    # Map address object name -> its IP/subnet/range
     addr_values = {}
     addr_re = re.compile(
         r'^set (device-group\s+\S+|shared)\s+address\s+(\S+)\s+(ip-netmask|ip-range)\s+(\S+)',
@@ -73,11 +65,8 @@ def main():
         if m:
             addr_values[m.group(2)] = m.group(4)
 
-    # ------------------------------------------------------------------
-    # Find NAT rule lines and replace object references where needed
-    # ------------------------------------------------------------------
     nat_re = re.compile(
-        r'^set (device-group\s+\S+|shared)\s+rulebase nat rules ',
+        r'^set (device-group\s+\S+|shared)\s+((?:pre|post)-rulebase nat|rulebase nat) rules ',
         re.IGNORECASE
     )
 
@@ -92,7 +81,6 @@ def main():
                 tokens = line.split()
                 changed = False
                 for i, t in enumerate(tokens):
-                    # Is token the name of an address object?
                     if t in addr_values:
                         old_val = addr_values[t]
                         new_val = translated_value(
@@ -100,7 +88,6 @@ def main():
                             one_to_one, networks, ranges
                         )
                         if new_val:
-                            # look for an existing address object whose value is new_val
                             for obj_name, obj_val in addr_values.items():
                                 if obj_val == new_val:
                                     tokens[i] = obj_name
