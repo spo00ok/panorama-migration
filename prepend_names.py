@@ -3,7 +3,7 @@ import os
 import re
 import shutil
 
-CONFIG_FILE = "panorama.set"
+CONFIG_FILE = "panorama.set"                 # Panorama set-command config file
 LOG_FILE    = "prepend_svb_host_update_refs.log"
 
 def main():
@@ -11,14 +11,15 @@ def main():
         print(f"Config file {CONFIG_FILE} not found.")
         return
 
+    # Backup the original file
     shutil.copy(CONFIG_FILE, CONFIG_FILE + ".bak")
 
-    # Read configuration safely
+    # Read the config safely
     with open(CONFIG_FILE, "r", encoding="utf-8", errors="replace") as f:
         lines = f.readlines()
 
     # ------------------------------------------------------------------
-    # 1️⃣ Collect address object & address-group names to rename
+    # 1️⃣ Collect address objects / address-groups that need renaming
     # ------------------------------------------------------------------
     rename_map = {}
     for l in lines:
@@ -45,7 +46,7 @@ def main():
             old_line = line
 
             # ------------------------------------------------------------------
-            # 2️⃣ Rename address/address-group definitions themselves
+            # 2️⃣ Rename the object definitions themselves
             # ------------------------------------------------------------------
             m = re.match(
                 r'^set (device-group\s+\S+|shared)\s+(address|address-group)\s+(".*?"|\S+)\s+(.*)',
@@ -71,18 +72,20 @@ def main():
             else:
                 # ------------------------------------------------------------------
                 # 3️⃣ Update references inside Security or NAT rules
-                #     – handles quoted rule names and [ ... ] lists
+                #     – works even when rule name is quoted and
+                #       objects appear inside [ ... ] brackets.
                 # ------------------------------------------------------------------
                 m_rule = re.match(
-                    r'^set (device-group\s+\S+|shared)\s+((pre|post)-rulebase (security|application-override)|rulebase nat) rules ("[^"]+"|\S+)\s+(.*)$',
+                    r'^set (device-group\s+\S+|shared)\s+((pre|post)-rulebase (security|application-override)|rulebase nat) '
+                    r'rules ("[^"]+"|\S+)\s+(.*)$',
                     stripped
                 )
                 if m_rule:
-                    # groups: 1 = DG/shared, 2 = rulebase path, 5 = rule name, 6 = remainder
+                    # Build the prefix (everything up to and including the rule name)
                     rule_prefix = f"set {m_rule.group(1)} {m_rule.group(2)} rules {m_rule.group(5)} "
                     remainder = m_rule.group(6)
 
-                    # prefix names inside [ ... ]
+                    # --- Replace inside square brackets first ---
                     def replace_inside_brackets(match):
                         inner = match.group(1)
                         tokens = inner.split()
@@ -100,7 +103,7 @@ def main():
 
                     remainder = re.sub(r'\[([^\]]+)\]', replace_inside_brackets, remainder)
 
-                    # prefix any remaining single tokens
+                    # --- Replace any remaining single tokens outside brackets ---
                     def replace_single(match):
                         tok = match.group(0)
                         clean = tok.strip('"')
@@ -116,6 +119,7 @@ def main():
 
             output_lines.append(line)
 
+    # Write the updated configuration back
     with open(CONFIG_FILE, "w", encoding="utf-8", errors="replace") as f:
         f.writelines(output_lines)
 
