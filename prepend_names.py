@@ -11,15 +11,14 @@ def main():
         print(f"Config file {CONFIG_FILE} not found.")
         return
 
-    # 🔹 Backup the config before editing
     shutil.copy(CONFIG_FILE, CONFIG_FILE + ".bak")
 
-    # Read config using UTF-8 and replace any invalid bytes
+    # Read configuration safely
     with open(CONFIG_FILE, "r", encoding="utf-8", errors="replace") as f:
         lines = f.readlines()
 
     # ------------------------------------------------------------------
-    # 1️⃣ Collect address object / address-group names for renaming
+    # 1️⃣ Collect address object & address-group names to rename
     # ------------------------------------------------------------------
     rename_map = {}
     for l in lines:
@@ -71,18 +70,19 @@ def main():
 
             else:
                 # ------------------------------------------------------------------
-                # 3️⃣ Update references in security or application-override rules
+                # 3️⃣ Update references inside Security or NAT rules
                 #     – handles quoted rule names and [ ... ] lists
                 # ------------------------------------------------------------------
                 m_rule = re.match(
-                    r'^set (device-group\s+\S+|shared)\s+(pre|post)-rulebase (security|application-override) rules ("[^"]+"|\S+)\s+(.*)$',
+                    r'^set (device-group\s+\S+|shared)\s+((pre|post)-rulebase (security|application-override)|rulebase nat) rules ("[^"]+"|\S+)\s+(.*)$',
                     stripped
                 )
                 if m_rule:
-                    rule_prefix = f"set {m_rule.group(1)} {m_rule.group(2)}-rulebase {m_rule.group(3)} rules {m_rule.group(4)} "
-                    remainder = m_rule.group(5)
+                    # groups: 1 = DG/shared, 2 = rulebase path, 5 = rule name, 6 = remainder
+                    rule_prefix = f"set {m_rule.group(1)} {m_rule.group(2)} rules {m_rule.group(5)} "
+                    remainder = m_rule.group(6)
 
-                    # Prefix names inside square brackets if found
+                    # prefix names inside [ ... ]
                     def replace_inside_brackets(match):
                         inner = match.group(1)
                         tokens = inner.split()
@@ -100,7 +100,7 @@ def main():
 
                     remainder = re.sub(r'\[([^\]]+)\]', replace_inside_brackets, remainder)
 
-                    # Also prefix any single unbracketed tokens
+                    # prefix any remaining single tokens
                     def replace_single(match):
                         tok = match.group(0)
                         clean = tok.strip('"')
@@ -116,7 +116,6 @@ def main():
 
             output_lines.append(line)
 
-    # 🔹 Write updated configuration back to the same file
     with open(CONFIG_FILE, "w", encoding="utf-8", errors="replace") as f:
         f.writelines(output_lines)
 
