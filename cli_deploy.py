@@ -2,18 +2,15 @@
 import paramiko
 import time
 import sys
-import re
 
 # ----------------------------------------------------------------------
-# Edit these values before running:
+# Configuration
 # ----------------------------------------------------------------------
 PANORAMA_HOST = "your.panorama.host"
 USERNAME      = "your_username"
 PASSWORD      = "your_password"
-COMMAND_FILE  = "panorama.set"     # file containing all set commands
-RETRY_LIMIT   = 3                  # max re-tries for failed lines
-BASE_DELAY    = 0.05               # initial delay between commands (seconds)
-SCALE_STEP    = 0.01               # extra delay added after each command
+COMMAND_FILE  = "panorama.set"     # file with all set commands
+DELAY_BETWEEN = 0.05              # fixed delay in seconds between commands
 # ----------------------------------------------------------------------
 
 def deploy_commands(host, user, passwd, commands):
@@ -23,52 +20,56 @@ def deploy_commands(host, user, passwd, commands):
 
     chan = ssh.invoke_shell()
     time.sleep(1)
-    chan.recv(9999)  # clear banner
+    chan.recv(9999)  # clear initial banner
 
     print(f"Connected to {host}")
 
-    # Enable scripting mode
+    # ------------------------------------------------------------------
+    # Enter configure mode
+    # ------------------------------------------------------------------
+    print("Entering configure mode...")
+    chan.send("configure\n")
+    time.sleep(1)
+    chan.recv(9999)
+
+    # Enable scripting mode (inside configure context)
+    print("Enabling scripting mode...")
     chan.send("set cli scripting-mode on\n")
     time.sleep(1)
     chan.recv(9999)
 
-    delay = BASE_DELAY
-    remaining = list(commands)
+    total = len(commands)
+    for idx, cmd in enumerate(commands, start=1):
+        chan.send(cmd + "\n")
+        print(f"[{idx}/{total}] Sent: {cmd}")
+        time.sleep(DELAY_BETWEEN)
 
-    for attempt in range(1, RETRY_LIMIT + 1):
-        failed = []
-        print(f"\nAttempt {attempt}: sending {len(remaining)} commands")
+    print("All configuration commands have been sent.")
 
-        for cmd in remaining:
-            chan.send(cmd + "\n")
-            time.sleep(delay)
-            delay += SCALE_STEP          # gradually increase delay
-        time.sleep(1)                     # give Panorama time to process
-        output = chan.recv(65535).decode(errors="ignore")
-        sys.stdout.write(output)
-        sys.stdout.flush()
+    # ------------------------------------------------------------------
+    # Final commit
+    # ------------------------------------------------------------------
+    print("Committing configuration to Panorama...")
+    chan.send("commit\n")
+    time.sleep(1)
 
-        # Look for errors to re-try
-        for cmd in remaining:
-            if re.search(rf"(Error|Invalid).*{re.escape(cmd.split()[0])}", output, re.IGNORECASE):
-                failed.append(cmd)
-
-        if not failed:
-            print("\n All commands applied successfully.")
-            break
-        else:
-            print(f"\n  {len(failed)} commands failed on attempt {attempt}.")
-            if attempt < RETRY_LIMIT:
-                print("Retrying in 5 seconds...")
-                time.sleep(5)
-                remaining = failed
-            else:
-                print("\n Some commands could not be applied after all retries:")
-                for f in failed:
-                    print("   ", f)
+    # Monitor commit progress
+    while True:
+        time.sleep(5)
+        if chan.recv_ready():
+            output = chan.recv(65535).decode(errors="ignore")
+            sys.stdout.write(output)
+            sys.stdout.flush()
+            # Heuristic: detect completion text
+            if ("Configuration committed successfully" in output
+                or "Commit succeeded" in output
+                or "commit complete" in output.lower()):
+                print("\nCommit completed.")
+                break
 
     chan.close()
     ssh.close()
+    print("Session closed.")
 
 def main():
     with open(COMMAND_FILE, "r", encoding="utf-8", errors="replace") as f:
@@ -77,3 +78,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
