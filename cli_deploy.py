@@ -9,9 +9,37 @@ import sys
 PANORAMA_HOST = "your.panorama.host"
 USERNAME      = "your_username"
 PASSWORD      = "your_password"
-COMMAND_FILE  = "panorama.set"     # file with all set commands
-DELAY_BETWEEN = 0.05              # fixed delay in seconds between commands
+COMMAND_FILE  = "panorama.set"
+DELAY_BETWEEN = 0.15          # seconds between commands
+COMMIT_EVERY  = 5000          # commit after this many commands
+CHECK_INTERVAL = 60           # check connection every 60 seconds
 # ----------------------------------------------------------------------
+
+def ensure_connection(chan):
+    """
+    Check that the SSH channel is alive. If not, raise an exception.
+    """
+    if chan.closed or not chan.active:
+        raise Exception("SSH channel closed unexpectedly.")
+
+def commit_config(chan):
+    """
+    Send a commit command and monitor output until completion.
+    """
+    print("\n*** Performing commit ***")
+    chan.send("commit\n")
+    time.sleep(1)
+    while True:
+        time.sleep(30)
+        if chan.recv_ready():
+            output = chan.recv(65535).decode(errors="ignore")
+            sys.stdout.write(output)
+            sys.stdout.flush()
+            if ("Configuration committed successfully" in output or
+                "Commit succeeded" in output or
+                "commit complete" in output.lower()):
+                print("\n*** Commit completed ***\n")
+                break
 
 def deploy_commands(host, user, passwd, commands):
     ssh = paramiko.SSHClient()
@@ -20,52 +48,42 @@ def deploy_commands(host, user, passwd, commands):
 
     chan = ssh.invoke_shell()
     time.sleep(1)
-    chan.recv(9999)  # clear initial banner
+    chan.recv(9999)  # clear banner
 
     print(f"Connected to {host}")
 
-    # ------------------------------------------------------------------
     # Enter configure mode
-    # ------------------------------------------------------------------
-    print("Entering configure mode...")
     chan.send("configure\n")
     time.sleep(1)
     chan.recv(9999)
 
-    # Enable scripting mode (inside configure context)
-    print("Enabling scripting mode...")
+    # Enable scripting mode
     chan.send("set cli scripting-mode on\n")
     time.sleep(1)
     chan.recv(9999)
 
     total = len(commands)
+    last_check = time.time()
+
     for idx, cmd in enumerate(commands, start=1):
+        # Health check every CHECK_INTERVAL seconds
+        if time.time() - last_check > CHECK_INTERVAL:
+            print("\n[Health Check] Verifying SSH connection...")
+            ensure_connection(chan)
+            last_check = time.time()
+            print("[Health Check] Connection is active.")
+
         chan.send(cmd + "\n")
         print(f"[{idx}/{total}] Sent: {cmd}")
         time.sleep(DELAY_BETWEEN)
 
-    print("All configuration commands have been sent.")
+        # Periodic commit every COMMIT_EVERY commands
+        if idx % COMMIT_EVERY == 0:
+            commit_config(chan)
 
-    # ------------------------------------------------------------------
-    # Final commit
-    # ------------------------------------------------------------------
-    print("Committing configuration to Panorama...")
-    chan.send("commit\n")
-    time.sleep(1)
-
-    # Monitor commit progress
-    while True:
-        time.sleep(5)
-        if chan.recv_ready():
-            output = chan.recv(65535).decode(errors="ignore")
-            sys.stdout.write(output)
-            sys.stdout.flush()
-            # Heuristic: detect completion text
-            if ("Configuration committed successfully" in output
-                or "Commit succeeded" in output
-                or "commit complete" in output.lower()):
-                print("\nCommit completed.")
-                break
+    print("\nAll configuration commands have been sent.")
+    print("Performing final commit...")
+    commit_config(chan)
 
     chan.close()
     ssh.close()
@@ -78,4 +96,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
