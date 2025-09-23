@@ -54,16 +54,16 @@ def deploy_commands(host, user, passwd, commands):
                 failed.append(cmd)
 
         if not failed:
-            print("\n✅ All commands applied successfully.")
+            print("\n All commands applied successfully.")
             break
         else:
-            print(f"\n⚠️  {len(failed)} commands failed on attempt {attempt}.")
+            print(f"\n  {len(failed)} commands failed on attempt {attempt}.")
             if attempt < RETRY_LIMIT:
                 print("Retrying in 5 seconds...")
                 time.sleep(5)
                 remaining = failed
             else:
-                print("\n❌ Some commands could not be applied after all retries:")
+                print("\n Some commands could not be applied after all retries:")
                 for f in failed:
                     print("   ", f)
 
