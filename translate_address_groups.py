@@ -96,6 +96,16 @@ def main():
     with open(CONFIG_FILE, "r") as f:
         lines = f.readlines()
 
+    # Build a lookup of address objects: ip/subnet -> object name
+    addr_obj_map = {}
+    addr_re = re.compile(r'^set (device-group \S+|shared) address (\S+) (ip-netmask|ip-range) (\S+)')
+    for l in lines:
+        m = addr_re.match(l.strip())
+        if m:
+            obj_name = m.group(2)
+            value = m.group(4)
+            addr_obj_map[value] = obj_name
+
     output_lines = []
     with open(LOG_FILE, "w") as log:
         for line in lines:
@@ -107,9 +117,15 @@ def main():
                     new_members = list(members)
                     for member in members:
                         t = translate_value(member)
-                        if t and t not in new_members:
-                            new_members.append(t)
-                            log.write(f"Group update: {member} -> {t}\n")
+                        if t:
+                            # find an existing address object whose value matches translated value
+                            if t in addr_obj_map:
+                                obj_to_add = addr_obj_map[t]
+                                if obj_to_add not in new_members:
+                                    new_members.append(obj_to_add)
+                                    log.write(f"Group update: {member} -> {obj_to_add}\n")
+                            else:
+                                log.write(f"Warning: No address object found for translated value {t} (member {member})\n")
                     new_members = unique(new_members)
                     new_line = re.sub(r"static\s+\[[^\]]+\]", "static [ " + " ".join(new_members) + " ]", stripped)
                     output_lines.append(new_line + "\n")
@@ -124,3 +140,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
