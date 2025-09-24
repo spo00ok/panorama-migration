@@ -41,18 +41,7 @@ def commit_config(chan):
     """Send a commit command and monitor until commit finishes."""
     print("\n*** Performing commit ***")
     chan.send("commit\n")
-    time.sleep(1)
-    while True:
-        time.sleep(5)
-        if chan.recv_ready():
-            output = chan.recv(65535).decode(errors="ignore")
-            sys.stdout.write(output)
-            sys.stdout.flush()
-            if ("Configuration committed successfully" in output
-                or "Commit succeeded" in output
-                or "commit complete" in output.lower()):
-                print("\n*** Commit completed ***\n")
-                break
+    time.sleep(30)
 
 def deploy_commands(commands):
     ssh, chan = connect_and_prepare()
@@ -88,6 +77,10 @@ def main():
     with open(COMMAND_FILE, "r", encoding="utf-8", errors="replace") as f:
         commands = [line.strip() for line in f if line.strip() and not line.startswith("#")]
     deploy_commands(commands)
+
+if __name__ == "__main__":
+    main()
+
 
 if __name__ == "__main__":
     main()
