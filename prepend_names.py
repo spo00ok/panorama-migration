@@ -13,7 +13,6 @@ def main():
 
     shutil.copy(CONFIG_FILE, CONFIG_FILE + ".bak")
 
-    # Read safely
     with open(CONFIG_FILE, "r", encoding="utf-8", errors="replace") as f:
         lines = f.readlines()
 
@@ -38,7 +37,7 @@ def main():
 
     output_lines = []
     with open(LOG_FILE, "w", encoding="utf-8", errors="replace") as log:
-        log.write("=== Prepend 'svb_host_' to Object Names and References Log ===\n\n")
+        log.write("=== Prepend 'svb_host_' to Object Names, References, and Address-Group Members ===\n\n")
 
         for line in lines:
             stripped = line.strip()
@@ -86,7 +85,7 @@ def main():
 
                     # Replace tokens inside [ ... ] lists first
                     def replace_inside_brackets(match):
-                        inner = match.group(1)  # may include leading/trailing spaces
+                        inner = match.group(1)
                         tokens = inner.split()
                         out = []
                         for tok in tokens:
@@ -114,9 +113,36 @@ def main():
                     log.write(f"UPDATED REFERENCE:\n  OLD: {old_line.rstrip()}\n"
                               f"  NEW: {line.rstrip()}\n\n")
 
+                else:
+                    # ------------------------------------------------------------------
+                    # 4) Prepend names in address-group static member lists themselves
+                    #    (not just when referenced in rules)
+                    # ------------------------------------------------------------------
+                    m_member = re.match(
+                        r'^(set (?:device-group\s+\S+|shared)\s+address-group\s+\S+\s+static\s+)\[([^\]]+)\](.*)$',
+                        stripped
+                    )
+                    if m_member:
+                        prefix, members_str, suffix = m_member.groups()
+                        members     = members_str.split()
+                        new_members = []
+                        changed = False
+                        for mbr in members:
+                            if mbr.strip('"') in rename_map:
+                                name = rename_map[mbr.strip('"')]
+                                if mbr.startswith('"'):
+                                    name = '"' + name + '"'
+                                new_members.append(name)
+                                changed = True
+                            else:
+                                new_members.append(mbr)
+                        if changed:
+                            line = f"{prefix}[{' '.join(new_members)}]{suffix}\n"
+                            log.write(f"UPDATED ADDRESS-GROUP MEMBERS:\n  OLD: {old_line.rstrip()}\n"
+                                      f"  NEW: {line.rstrip()}\n\n")
+
             output_lines.append(line)
 
-    # Write back
     with open(CONFIG_FILE, "w", encoding="utf-8", errors="replace") as f:
         f.writelines(output_lines)
 
