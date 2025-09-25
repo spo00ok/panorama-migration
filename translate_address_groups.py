@@ -118,7 +118,7 @@ ADDR_OBJ_RE = re.compile(
 )
 
 ADDR_GRP_STATIC_RE = re.compile(
-    r'^(set (device-group\s+\S+|shared)\s+address-group\s+(".*?"|\S+)\s+static\s+)\[([^\]]+)\](.*)$',
+    r'^(set (device-group\s+\S+|shared)\s+address-group\s+(".*?"|\S+)\s+static\s+)(?:\[([^\]]+)\]|(\S+))(.*)$',
     re.IGNORECASE
 )
 
