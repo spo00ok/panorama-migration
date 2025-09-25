@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-import re
+import shlex
 import shutil
 
-CONFIG_FILE = "panorama.set"        # Panorama set-command config
-MAPPING_FILE = "zone_mapping.input" # device-group to zone mapping
-LOG_FILE = "add_zones.log"
+CONFIG_FILE  = "panorama.set"         # Panorama set-command config
+MAPPING_FILE = "zone_mapping.input"   # device-group to zone mapping
+LOG_FILE     = "add_zones.log"
 
 def load_mapping():
     """Load device-group -> zone mapping from zone_mapping.input"""
@@ -18,6 +18,13 @@ def load_mapping():
             mapping[dg] = zone
     return mapping
 
+def needs_quotes(s: str) -> bool:
+    return any(c.isspace() for c in s)
+
+def rule_token(rule_name: str) -> str:
+    """Rebuild rule name token, quoting if it contains spaces."""
+    return f'"{rule_name}"' if needs_quotes(rule_name) else rule_name
+
 def main():
     shutil.copy(CONFIG_FILE, CONFIG_FILE + ".bak")
     mapping = load_mapping()
@@ -25,60 +32,115 @@ def main():
     with open(CONFIG_FILE, "r", encoding="utf-8", errors="replace") as f:
         lines = f.readlines()
 
-    output = []
+    out = []
     with open(LOG_FILE, "w", encoding="utf-8") as log:
-        log.write("=== Add zones based on device-group mapping ===\n\n")
-
-        # Match security rule zone lines
-        zone_re = re.compile(
-            r'^set (device-group\s+(\S+)) (?:pre|post)-rulebase security rules ("[^"]+"|\S+) '
-            r'(from|to) (.+)$', re.IGNORECASE)
+        log.write("=== Add zones based on device-group mapping (tokenized matcher) ===\n\n")
 
         for raw in lines:
-            stripped = raw.strip()
-            m = zone_re.match(stripped)
-            if not m:
-                output.append(raw)
+            line = raw.rstrip("\n")
+            stripped = line.strip()
+
+            # Fast path: must start with 'set device-group '
+            if not stripped.lower().startswith("set device-group "):
+                out.append(raw)
                 continue
 
-            full_scope, dg_name, rule_name, direction, zones_part = m.groups()
-            mapped_zone = mapping.get(dg_name)
+            # Tokenize safely (handles quoted rule names, bracket lists, etc.)
+            try:
+                toks = shlex.split(stripped)
+            except ValueError:
+                # If tokenization fails, leave line untouched
+                out.append(raw)
+                continue
+
+            # Expect at least: set device-group <DG> <pre|post>-rulebase security rules <rule-name> <from|to> <zones...>
+            if len(toks) < 9:
+                out.append(raw)
+                continue
+
+            if toks[0].lower() != "set":
+                out.append(raw)
+                continue
+            if toks[1].lower() != "device-group":
+                out.append(raw)
+                continue
+
+            dg = toks[2]
+            prepost = toks[3].lower()
+            if prepost not in ("pre-rulebase", "post-rulebase"):
+                out.append(raw)
+                continue
+
+            if toks[4].lower() != "security" or toks[5].lower() != "rules":
+                out.append(raw)
+                continue
+
+            rule_name = toks[6]  # shlex returns unquoted name (spaces preserved in one token)
+            prop = toks[7].lower()
+
+            # Only operate on 'from' or 'to' zone lines
+            if prop not in ("from", "to"):
+                out.append(raw)
+                continue
+
+            mapped_zone = mapping.get(dg)
             if not mapped_zone:
-                output.append(raw)
+                out.append(raw)
                 continue
 
-            # Tokenize the existing zone list (handles quoted zone names)
-            import shlex
-            tokens = shlex.split(zones_part)
-
-            # Skip if mapped zone already present
-            if mapped_zone in [t.strip('"') for t in tokens]:
-                output.append(raw)
+            # Extract existing zone tokens (could be single or bracketed list like: [ zone1 zone2 ])
+            zone_tokens = toks[8:]
+            if not zone_tokens:
+                out.append(raw)
                 continue
 
-            # Add mapped zone and bracket if needed
-            if len(tokens) == 1:
-                # Only one existing zone -> add brackets with required spaces
-                new_zones = f"[ {tokens[0]} {mapped_zone} ]"
+            # Determine zone list and whether already bracketed
+            bracketed = False
+            zones = []
+            if zone_tokens[0] == "[" and zone_tokens[-1] == "]" and len(zone_tokens) >= 3:
+                bracketed = True
+                zones = zone_tokens[1:-1]  # inside brackets
             else:
-                # Already bracketed or multi-zones -> just append mapped_zone,
-                # preserving any existing bracket syntax.
-                if zones_part.strip().startswith("["):
-                    # insert before closing bracket, maintain spaces
-                    new_zones = re.sub(r'\]\s*$', f' {mapped_zone} ]', zones_part)
-                else:
-                    # multiple zones but not bracketed: wrap all in brackets
-                    new_zones = "[ " + " ".join(tokens + [mapped_zone]) + " ]"
+                zones = zone_tokens[:]     # single token or multiple without brackets
 
-            new_line = f"set {full_scope} pre-rulebase security rules {rule_name} {direction} {new_zones}\n"
-            output.append(new_line)
-            log.write(f"UPDATED:\n  OLD: {stripped}\n  NEW: {new_line.rstrip()}\n\n")
+            # Skip if mapped zone already present (compare token text)
+            if mapped_zone in zones:
+                out.append(raw)
+                continue
+
+            # Add mapped zone and normalize to bracketed form when we are going from 1 -> 2 zones
+            if bracketed:
+                new_zone_str = "[ " + " ".join(zones + [mapped_zone]) + " ]"
+            else:
+                if len(zones) == 1:
+                    # Wrap in brackets with the new zone
+                    new_zone_str = "[ " + zones[0] + " " + mapped_zone + " ]"
+                else:
+                    # Multiple zones but not bracketed; wrap all
+                    new_zone_str = "[ " + " ".join(zones + [mapped_zone]) + " ]"
+
+            # Rebuild the line
+            new_line = (
+                "set device-group "
+                + dg
+                + " "
+                + prepost
+                + " security rules "
+                + rule_token(rule_name)
+                + " "
+                + prop
+                + " "
+                + new_zone_str
+            )
+
+            out.append(new_line + "\n")
+            log.write("UPDATED:\n  OLD: " + stripped + "\n  NEW: " + new_line + "\n\n")
 
     with open(CONFIG_FILE, "w", encoding="utf-8", errors="replace") as f:
-        f.writelines(output)
+        f.writelines(out)
 
-    print(f"✅ Updated {CONFIG_FILE} in place (backup saved as {CONFIG_FILE}.bak)")
-    print(f"✅ Detailed changes logged to {LOG_FILE}")
+    print(f"Updated {CONFIG_FILE} (backup at {CONFIG_FILE}.bak)")
+    print(f"Log written to {LOG_FILE}")
 
 if __name__ == "__main__":
     main()
