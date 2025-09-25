@@ -51,12 +51,12 @@ def main():
             import shlex
             tokens = shlex.split(zones_part)
 
-            # 1️⃣ Skip if mapped zone already present
+            # Skip if mapped zone already present
             if mapped_zone in [t.strip('"') for t in tokens]:
                 output.append(raw)
                 continue
 
-            # 2️⃣ Add mapped zone and bracket if needed
+            # Add mapped zone and bracket if needed
             if len(tokens) == 1:
                 # Only one existing zone -> add brackets with required spaces
                 new_zones = f"[ {tokens[0]} {mapped_zone} ]"
@@ -82,3 +82,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
