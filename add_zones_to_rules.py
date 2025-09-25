@@ -45,11 +45,9 @@ def main():
                 out.append(raw)
                 continue
 
-            # Tokenize safely (handles quoted rule names, bracket lists, etc.)
             try:
                 toks = shlex.split(stripped)
             except ValueError:
-                # If tokenization fails, leave line untouched
                 out.append(raw)
                 continue
 
@@ -57,11 +55,7 @@ def main():
             if len(toks) < 9:
                 out.append(raw)
                 continue
-
-            if toks[0].lower() != "set":
-                out.append(raw)
-                continue
-            if toks[1].lower() != "device-group":
+            if toks[0].lower() != "set" or toks[1].lower() != "device-group":
                 out.append(raw)
                 continue
 
@@ -75,7 +69,7 @@ def main():
                 out.append(raw)
                 continue
 
-            rule_name = toks[6]  # shlex returns unquoted name (spaces preserved in one token)
+            rule_name = toks[6]  # shlex returns unquoted rule name as single token
             prop = toks[7].lower()
 
             # Only operate on 'from' or 'to' zone lines
@@ -88,9 +82,13 @@ def main():
                 out.append(raw)
                 continue
 
-            # Extract existing zone tokens (could be single or bracketed list like: [ zone1 zone2 ])
             zone_tokens = toks[8:]
             if not zone_tokens:
+                out.append(raw)
+                continue
+
+            # 1️⃣ Skip if the clause is literally "any"
+            if len(zone_tokens) == 1 and zone_tokens[0].lower() == "any":
                 out.append(raw)
                 continue
 
@@ -101,22 +99,20 @@ def main():
                 bracketed = True
                 zones = zone_tokens[1:-1]  # inside brackets
             else:
-                zones = zone_tokens[:]     # single token or multiple without brackets
+                zones = zone_tokens[:]
 
-            # Skip if mapped zone already present (compare token text)
+            # 2️⃣ Skip if mapped zone already present
             if mapped_zone in zones:
                 out.append(raw)
                 continue
 
-            # Add mapped zone and normalize to bracketed form when we are going from 1 -> 2 zones
+            # 3️⃣ Add mapped zone and normalise to bracketed form when needed
             if bracketed:
                 new_zone_str = "[ " + " ".join(zones + [mapped_zone]) + " ]"
             else:
                 if len(zones) == 1:
-                    # Wrap in brackets with the new zone
                     new_zone_str = "[ " + zones[0] + " " + mapped_zone + " ]"
                 else:
-                    # Multiple zones but not bracketed; wrap all
                     new_zone_str = "[ " + " ".join(zones + [mapped_zone]) + " ]"
 
             # Rebuild the line
@@ -139,9 +135,8 @@ def main():
     with open(CONFIG_FILE, "w", encoding="utf-8", errors="replace") as f:
         f.writelines(out)
 
-    print(f"Updated {CONFIG_FILE} (backup at {CONFIG_FILE}.bak)")
-    print(f"Log written to {LOG_FILE}")
+    print(f"✅ Updated {CONFIG_FILE} in place (backup saved as {CONFIG_FILE}.bak)")
+    print(f"✅ Log written to {LOG_FILE}")
 
 if __name__ == "__main__":
     main()
-
