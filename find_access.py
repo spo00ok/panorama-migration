@@ -1,222 +1,174 @@
 #!/usr/bin/env python3
 """
-compile_access_from_rules.py
+find_logical_rules_for_ips.py
 
 Given:
-  1) A CSV produced by panorama_security_rules_to_csv.py (one logical row per combo)
-  2) A list of IPs (file or command-line)
-  3) Optionally: address objects and groups exported to CSV
+  1) A "logical rules" CSV (from snapshot_to_logical_rules_resolved.py or the API version)
+     Expected columns include:
+       device_group, rulebase, rule_name, action, disabled,
+       from, to, source_network, destination_network, application, service, url_category, ...
+  2) A text file of targets: one per line, each a literal IP, CIDR, dotted-netmask, or range:
+       192.0.2.10
+       10.0.0.0/8
+       10.1.2.0/255.255.255.0
+       172.16.10.10-172.16.10.99
+     Lines starting with '#' are ignored.
 
-Produce:
-  A CSV listing, for each IP, the rules that match it as source and/or destination.
+Outputs:
+  A CSV of rule matches. Each output row shows which target matched which rule,
+  on which side (src/dst/both), and which policy networks matched.
 
-Matching logic:
-- 'any' matches everything
-- literal IP (e.g., 10.1.2.3) and CIDR (e.g., 10.1.0.0/16) are matched directly
-- object/group names are resolved if you provide object/group CSVs
-- ports/app/url-category are not filtered — the script reports rule *potential* access
-
-Address/Group CSV formats (optional but recommended if your rules use objects):
-- --addr-objects CSV with columns: name,type,value
-    type ∈ { ip-netmask, ip-cidr, ip-range, ip, fqdn }
-    examples:
-      name=web1, type=ip,         value=10.1.2.3
-      name=lan24, type=ip-cidr,   value=10.1.0.0/24
-      name=dmz,   type=ip-range,  value=10.10.0.10-10.10.0.99
-      name=legacy, type=ip-netmask, value=10.20.30.0/255.255.255.0
-      name=app.fqdn, type=fqdn, value=app.example.com  (DNS not resolved; skipped)
-- --addr-groups CSV with columns: name,members
-    members are ';' separated names of objects or other groups (recursive supported)
+Matching modes:
+  - subset (default): the target IP/subnet must be fully contained within the policy network.
+    Example: target 10.1.2.0/24 matches policy 10.0.0.0/8 (True), but not the reverse.
+  - intersect: any overlap between target and policy network counts.
 
 Usage:
-  python compile_access_from_rules.py \
-    --rules-csv rules.csv \
-    --ips-file ip_list.txt \
-    -o access.csv \
-    --addr-objects addr_objects.csv \
-    --addr-groups addr_groups.csv
-
-  # Or pass IPs inline:
-  python compile_access_from_rules.py --rules-csv rules.csv --ip 10.1.2.3 --ip 172.16.5.10 -o access.csv
-
-Flags:
-  --include-deny       Include action=deny (default is allow-only)
-  --include-disabled   Include disabled rules (default excludes)
-  --direction both|src|dst   Limit match side (default both)
+  python find_logical_rules_for_ips.py \
+      --rules-csv logical_rules.csv \
+      --targets targets.txt \
+      -o matches.csv \
+      --direction both \
+      --mode subset \
+      --include-deny --include-disabled
 """
 
 import argparse
 import csv
 import ipaddress
-from typing import Dict, List, Tuple, Set, Optional
-from functools import lru_cache
+from typing import Dict, List, Tuple, Optional, Iterable, Set
 
 # -----------------------------
-# Helpers for parsing networks
+# Target parsing helpers
 # -----------------------------
 
-def _parse_netmask_form(s: str) -> Optional[ipaddress.IPv4Network]:
-    # e.g., 10.1.2.0/255.255.255.0
+def _parse_netmask_form(s: str) -> Optional[ipaddress._BaseNetwork]:
+    # "10.1.2.0/255.255.255.0" -> 10.1.2.0/24
     try:
         ip, mask = s.split("/")
-        # Convert dotted mask to prefix
-        m = ipaddress.IPv4Address(mask).packed
-        prefix = sum(bin(b).count("1") for b in m)
-        return ipaddress.IPv4Network(f"{ip}/{prefix}", strict=False)
+        packed = ipaddress.ip_address(mask).packed
+        prefix = sum(bin(b).count("1") for b in packed)
+        return ipaddress.ip_network(f"{ip}/{prefix}", strict=False)
     except Exception:
         return None
 
-def _parse_range_form(s: str) -> Optional[Tuple[ipaddress.IPv4Address, ipaddress.IPv4Address]]:
-    # e.g., 10.0.0.10-10.0.0.99
+def _parse_range_form(s: str) -> Optional[Tuple[ipaddress._BaseAddress, ipaddress._BaseAddress]]:
+    # "10.0.0.10-10.0.0.99"
     try:
         a, b = s.split("-")
-        return (ipaddress.ip_address(a), ipaddress.ip_address(b))
+        return ipaddress.ip_address(a.strip()), ipaddress.ip_address(b.strip())
     except Exception:
         return None
 
-def token_to_networks(token: str) -> List[ipaddress._BaseNetwork]:
-    """Parse a literal token into networks (CIDR) if possible."""
+def parse_target_to_networks(token: str) -> List[ipaddress._BaseNetwork]:
+    """
+    Convert a target token (IP, CIDR, dotted-netmask, range) to one or more CIDR networks.
+    """
     token = (token or "").strip()
-    if token.lower() == "any" or token == "":
+    if not token or token.startswith("#"):
         return []
-    # CIDR
+
+    # CIDR or bare IP
     try:
-        net = ipaddress.ip_network(token, strict=False)
-        return [net]
+        n = ipaddress.ip_network(token, strict=False)
+        return [n]
     except Exception:
         pass
-    # Single IP
-    try:
-        ip = ipaddress.ip_address(token)
-        # make /32 or /128
-        if isinstance(ip, ipaddress.IPv4Address):
-            return [ipaddress.ip_network(f"{ip}/32")]
-        else:
-            return [ipaddress.ip_network(f"{ip}/128")]
-    except Exception:
-        pass
-    # Netmask form
+
+    # dotted netmask
     nm = _parse_netmask_form(token)
     if nm:
         return [nm]
-    # Range form
+
+    # range
     r = _parse_range_form(token)
     if r:
         a, b = r
-        # convert to minimal CIDR set
-        nets = list(ipaddress.summarize_address_range(a, b))
-        return nets
-    return []  # likely an object/group name
+        return list(ipaddress.summarize_address_range(a, b))
 
-# ------------------------------------
-# Address object / group map handling
-# ------------------------------------
+    raise ValueError(f"Unrecognized target expression: {token}")
 
-def load_addr_objects(path: str) -> Dict[str, List[ipaddress._BaseNetwork]]:
-    """
-    Expect columns: name,type,value
-    type in { ip, ip-cidr, ip-netmask, ip-range, fqdn }
-    """
-    out: Dict[str, List[ipaddress._BaseNetwork]] = {}
-    if not path:
-        return out
-    with open(path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            name = (row.get("name") or "").strip()
-            typ = (row.get("type") or "").strip().lower()
-            val = (row.get("value") or "").strip()
-            nets: List[ipaddress._BaseNetwork] = []
-            if typ in {"ip", "ip-cidr"}:
-                nets = token_to_networks(val)
-            elif typ == "ip-netmask":
-                nm = _parse_netmask_form(val)
-                if nm:
-                    nets = [nm]
-            elif typ == "ip-range":
-                r = _parse_range_form(val)
-                if r:
-                    nets = list(ipaddress.summarize_address_range(*r))
-            elif typ == "fqdn":
-                # DNS not resolved (offline & variable) — skip
-                nets = []
-            if name:
-                out[name] = nets
-    return out
-
-def load_addr_groups(path: str) -> Dict[str, List[str]]:
-    """
-    Expect columns: name,members   where members are ';' separated names.
-    """
-    out: Dict[str, List[str]] = {}
-    if not path:
-        return out
-    with open(path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            name = (row.get("name") or "").strip()
-            members = (row.get("members") or "").strip()
-            mems = [m.strip() for m in members.split(";") if m.strip()] if members else []
-            if name:
-                out[name] = mems
-    return out
-
-def build_resolver(obj_map: Dict[str, List[ipaddress._BaseNetwork]],
-                   grp_map: Dict[str, List[str]]):
-    """Return a function name->List[networks], expanding groups recursively."""
-    @lru_cache(maxsize=4096)
-    def resolve(name: str) -> List[ipaddress._BaseNetwork]:
-        name = (name or "").strip()
-        if not name:
-            return []
-        # direct object?
-        if name in obj_map:
-            return obj_map[name]
-        # group?
-        nets: List[ipaddress._BaseNetwork] = []
-        seen: Set[str] = set()
-
-        def dfs(n: str):
-            if n in seen:
-                return
-            seen.add(n)
-            if n in obj_map:
-                nets.extend(obj_map[n])
-            elif n in grp_map:
-                for m in grp_map[n]:
-                    dfs(m)
-            # else: unknown name — ignore
-
-        dfs(name)
-        return nets
-    return resolve
+def load_targets(path: str) -> List[ipaddress._BaseNetwork]:
+    nets: List[ipaddress._BaseNetwork] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            nets.extend(parse_target_to_networks(s))
+    # Dedup / normalize ordering to improve cache locality
+    nets = sorted(set(nets), key=lambda n: (n.version, int(n.network_address), int(n.prefixlen)))
+    return nets
 
 # -----------------------------
-# Rule matching
+# Policy network parsing
 # -----------------------------
 
-def ip_matches_token(ip: ipaddress._BaseAddress, token: str,
-                     resolve_name) -> Tuple[bool, str]:
-    """
-    Returns (match?, explanation).
-    explanation is either 'any', 'literal:<token>', or 'object:<name>'
-    """
-    token = (token or "").strip()
-    if token == "" or token.lower() == "any":
-        return True, "any"
-    # literal?
-    nets = token_to_networks(token)
-    if nets:
-        for n in nets:
-            if ip in n:
-                return True, f"literal:{token}"
-        return False, ""
-    # object/group name
-    nets = resolve_name(token)
-    for n in nets:
-        if ip in n:
-            return True, f"object:{token}"
-    return False, ""
+def split_network_list(s: str) -> List[str]:
+    # Source/destination networks might be a single value or a ';'-joined list
+    if s is None:
+        return []
+    s = s.strip()
+    if not s:
+        return []
+    parts = [p.strip() for p in s.split(";") if p.strip()]
+    return parts if parts else []
 
-def should_include(row: Dict[str, str], include_deny: bool, include_disabled: bool) -> bool:
+def to_ipnetwork_list(tokens: Iterable[str]) -> Tuple[List[ipaddress._BaseNetwork], bool]:
+    """
+    Convert tokens (e.g., ['10.0.0.0/8', '192.0.2.0/24']) into ip_network list.
+    Returns (networks, has_any).
+    """
+    nets: List[ipaddress._BaseNetwork] = []
+    has_any = False
+    for t in tokens:
+        if t.lower() == "any":
+            has_any = True
+            continue
+        try:
+            nets.append(ipaddress.ip_network(t, strict=False))
+        except Exception:
+            # Ignore unparseable (shouldn't happen for "logical" CSV, but be defensive)
+            continue
+    # Canonical order
+    nets = sorted(nets, key=lambda n: (n.version, int(n.network_address), int(n.prefixlen)))
+    return nets, has_any
+
+# -----------------------------
+# Matching logic
+# -----------------------------
+
+def match_target_policy(
+    target: ipaddress._BaseNetwork,
+    policy_nets: List[ipaddress._BaseNetwork],
+    has_any: bool,
+    mode: str
+) -> Tuple[bool, List[str]]:
+    """
+    Returns (matched?, matched_policy_net_strings)
+    mode: 'subset' (target ⊆ policy) or 'intersect' (target ∩ policy ≠ ∅)
+    """
+    if has_any:
+        return True, ["any"]
+
+    matched: List[str] = []
+    if mode == "subset":
+        for pn in policy_nets:
+            # Only compare within same IP family
+            if pn.version != target.version:
+                continue
+            if target.subnet_of(pn):
+                matched.append(str(pn))
+    else:  # intersect
+        for pn in policy_nets:
+            if pn.version != target.version:
+                continue
+            if target.overlaps(pn):
+                matched.append(str(pn))
+
+    return (len(matched) > 0), matched
+
+def rule_included(row: Dict[str, str], include_deny: bool, include_disabled: bool) -> bool:
     if not include_disabled and (row.get("disabled", "").lower() in {"yes", "true", "1"}):
         return False
     action = (row.get("action") or "").lower()
@@ -229,111 +181,127 @@ def should_include(row: Dict[str, str], include_deny: bool, include_disabled: bo
 # -----------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Compile per-IP access list from Panorama logical rules CSV.")
-    ap.add_argument("--rules-csv", required=True, help="CSV from panorama_security_rules_to_csv.py")
-    ap.add_argument("--ips-file", help="File with one IP per line")
-    ap.add_argument("--ip", action="append", default=[], help="Add an IP inline (repeatable)")
-    ap.add_argument("-o", "--output", default="compiled_access.csv", help="Output CSV")
-    ap.add_argument("--addr-objects", help="Address objects CSV (name,type,value)")
-    ap.add_argument("--addr-groups", help="Address groups CSV (name,members, ';' separated)")
+    ap = argparse.ArgumentParser(description="Find logical rule matches for a list of IPs/subnets/ranges.")
+    ap.add_argument("--rules-csv", required=True, help="Logical rules CSV (from *to_logical_rules*_resolved.py)")
+    ap.add_argument("--targets", required=True, help="Text file with IPs/subnets/ranges (one per line)")
+    ap.add_argument("-o", "--output", default="matches.csv", help="Output CSV path")
+    ap.add_argument("--direction", choices=["both", "src", "dst"], default="both", help="Which side(s) to check")
+    ap.add_argument("--mode", choices=["subset", "intersect"], default="subset",
+                    help="Match mode: 'subset' (target must be contained in policy) or 'intersect' (any overlap)")
     ap.add_argument("--include-deny", action="store_true", help="Include rules with action != allow")
     ap.add_argument("--include-disabled", action="store_true", help="Include disabled rules")
-    ap.add_argument("--direction", choices=["both", "src", "dst"], default="both", help="Match side to consider")
     args = ap.parse_args()
 
-    # Load IPs
-    ips: List[str] = list(args.ip)
-    if args.ips_file:
-        with open(args.ips_file, "r", encoding="utf-8") as f:
-            for line in f:
-                s = line.strip()
-                if s and not s.startswith("#"):
-                    ips.append(s)
-    if not ips:
-        raise SystemExit("No IPs provided. Use --ips-file or --ip.")
+    targets = load_targets(args.targets)
+    if not targets:
+        raise SystemExit("No valid targets loaded.")
 
-    parsed_ips: List[ipaddress._BaseAddress] = []
-    for s in ips:
-        try:
-            parsed_ips.append(ipaddress.ip_address(s))
-        except Exception:
-            raise SystemExit(f"Invalid IP: {s}")
-
-    # Load address maps (optional)
-    obj_map = load_addr_objects(args.addr_objects) if args.addr_objects else {}
-    grp_map = load_addr_groups(args.addr_groups) if args.addr_groups else {}
-    resolve_name = build_resolver(obj_map, grp_map)
-
-    # Read rules CSV
-    with open(args.rules_csv, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        rules = list(reader)
-    if not rules:
-        raise SystemExit("No rows found in rules CSV.")
-
-    # Output
+    # Prepare CSV output
     out_fields = [
-        "ip", "direction", "device_group", "rulebase", "rule_name", "action", "disabled",
-        "from", "to", "source", "destination",
-        "source_match_by", "destination_match_by",
-        "service", "application", "url-category", "tags", "profile_groups", "description", "log_setting", "schedule"
+        "target", "target_version", "direction",
+        "device_group", "rulebase", "rule_name",
+        "matched_policy_networks",
+        "action", "disabled",
+        "from", "to", "service", "application", "url_category",
+        "tags", "profile_groups", "description", "log_setting", "schedule",
+        "source_all_resolved", "destination_all_resolved", "unresolved_notes",
     ]
-    with open(args.output, "w", newline="", encoding="utf-8") as fo:
-        w = csv.DictWriter(fo, fieldnames=out_fields)
-        w.writeheader()
 
-        for ip in parsed_ips:
-            for row in rules:
-                if not should_include(row, args.include_deny, args.include_disabled):
-                    continue
+    with open(args.rules_csv, newline="", encoding="utf-8") as fi, \
+         open(args.output, "w", newline="", encoding="utf-8") as fo:
 
-                src_ok, src_how = ip_matches_token(ip, row.get("source", ""), resolve_name)
-                dst_ok, dst_how = ip_matches_token(ip, row.get("destination", ""), resolve_name)
+        reader = csv.DictReader(fi)
+        writer = csv.DictWriter(fo, fieldnames=out_fields)
+        writer.writeheader()
 
-                match = False
-                direction = ""
-                if args.direction in ("both", "src") and src_ok:
-                    match = True
-                    direction = "src" if args.direction != "both" else ("src" if not dst_ok else "both")
-                if args.direction in ("both", "dst") and dst_ok:
-                    match = True
-                    if direction == "":
-                        direction = "dst"
-                    elif direction == "src" and dst_ok:
-                        direction = "both"
+        for row in reader:
+            if not rule_included(row, args.include_deny, args.include_disabled):
+                continue
 
-                if not match:
-                    continue
+            # Parse source/destination networks for this rule row
+            src_tokens = split_network_list(row.get("source_network", ""))
+            dst_tokens = split_network_list(row.get("destination_network", ""))
 
-                w.writerow({
-                    "ip": str(ip),
-                    "direction": direction,
-                    "device_group": row.get("device_group", ""),
-                    "rulebase": row.get("rulebase", ""),
-                    "rule_name": row.get("rule_name", ""),
-                    "action": row.get("action", ""),
-                    "disabled": row.get("disabled", ""),
-                    "from": row.get("from", ""),
-                    "to": row.get("to", ""),
-                    "source": row.get("source", ""),
-                    "destination": row.get("destination", ""),
-                    "source_match_by": src_how,
-                    "destination_match_by": dst_how,
-                    "service": row.get("service", ""),
-                    "application": row.get("application", ""),
-                    "url-category": row.get("url-category", ""),
-                    "tags": row.get("tags", ""),
-                    "profile_groups": row.get("profile_groups", ""),
-                    "description": row.get("description", ""),
-                    "log_setting": row.get("log_setting", ""),
-                    "schedule": row.get("schedule", ""),
-                })
+            src_nets, src_has_any = to_ipnetwork_list(src_tokens)
+            dst_nets, dst_has_any = to_ipnetwork_list(dst_tokens)
+
+            # If neither side has any parseable network and no 'any', skip early.
+            if args.direction in ("both", "src") and not (src_nets or src_has_any):
+                pass  # still might match if tokens were 'any' (already captured) or empty -> treat as no
+            if args.direction in ("both", "dst") and not (dst_nets or dst_has_any):
+                pass
+
+            # For each target, check match on requested directions
+            for tgt in targets:
+                wrote = False
+
+                # SRC
+                if args.direction in ("both", "src"):
+                    matched, matched_list = match_target_policy(tgt, src_nets, src_has_any, args.mode)
+                    if matched:
+                        writer.writerow({
+                            "target": str(tgt),
+                            "target_version": "ipv6" if tgt.version == 6 else "ipv4",
+                            "direction": "src" if args.direction != "both" else ("both" if wrote else "src"),
+                            "device_group": row.get("device_group", ""),
+                            "rulebase": row.get("rulebase", ""),
+                            "rule_name": row.get("rule_name", ""),
+                            "matched_policy_networks": ";".join(matched_list),
+                            "action": row.get("action", ""),
+                            "disabled": row.get("disabled", ""),
+                            "from": row.get("from", ""),
+                            "to": row.get("to", ""),
+                            "service": row.get("service", ""),
+                            "application": row.get("application", ""),
+                            "url_category": row.get("url-category", row.get("url_category", "")),
+                            "tags": row.get("tags", ""),
+                            "profile_groups": row.get("profile_groups", ""),
+                            "description": row.get("description", ""),
+                            "log_setting": row.get("log_setting", ""),
+                            "schedule": row.get("schedule", ""),
+                            "source_all_resolved": row.get("source_all_resolved", ""),
+                            "destination_all_resolved": row.get("destination_all_resolved", ""),
+                            "unresolved_notes": row.get("unresolved_notes", ""),
+                        })
+                        wrote = True
+
+                # DST
+                if args.direction in ("both", "dst"):
+                    matched, matched_list = match_target_policy(tgt, dst_nets, dst_has_any, args.mode)
+                    if matched:
+                        writer.writerow({
+                            "target": str(tgt),
+                            "target_version": "ipv6" if tgt.version == 6 else "ipv4",
+                            "direction": "dst" if args.direction != "both" else ("both" if wrote else "dst"),
+                            "device_group": row.get("device_group", ""),
+                            "rulebase": row.get("rulebase", ""),
+                            "rule_name": row.get("rule_name", ""),
+                            "matched_policy_networks": ";".join(matched_list),
+                            "action": row.get("action", ""),
+                            "disabled": row.get("disabled", ""),
+                            "from": row.get("from", ""),
+                            "to": row.get("to", ""),
+                            "service": row.get("service", ""),
+                            "application": row.get("application", ""),
+                            "url_category": row.get("url-category", row.get("url_category", "")),
+                            "tags": row.get("tags", ""),
+                            "profile_groups": row.get("profile_groups", ""),
+                            "description": row.get("description", ""),
+                            "log_setting": row.get("log_setting", ""),
+                            "schedule": row.get("schedule", ""),
+                            "source_all_resolved": row.get("source_all_resolved", ""),
+                            "destination_all_resolved": row.get("destination_all_resolved", ""),
+                            "unresolved_notes": row.get("unresolved_notes", ""),
+                        })
 
     print(f"Done. Wrote: {args.output}")
     print("Notes:")
-    print("- Only literal IP/CIDR and provided object/group mappings are matched.")
-    print("- FQDN address objects are skipped (no DNS lookups).")
-    print("- Service/ports and apps are reported but not filtered.")
-
+    print("- Default match mode is 'subset' (targets must fall entirely inside the policy network).")
+    print("- Use --mode intersect to match any overlap.")
+    print("- By default, only enabled allow rules are reported; add --include-deny and/or --include-disabled to widen results.")
+    print("- If your logical rules CSV collapsed source/destination into ';'-lists, this script still handles them.")
+    print("- 'any' on a side matches all targets for that side.")
+    print("- Supports IPv4 and IPv6.")
+    
 if __name__ == "__main__":
     main()
