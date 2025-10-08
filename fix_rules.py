@@ -15,10 +15,12 @@ RULE_SCOPE_RE = re.compile(
 # 3) (Shared) set address <name> ip-netmask <cidr>
 # 4) (Shared) set address <name> ip-range <start>-<end>
 ADDR_OBJ_IPNET_RE = re.compile(
-    r'^set\s+(?:device-group\s+(?P<dg>\S+)\s+)?address\s+(?P<name>\".*?\"|\S+)\s+ip-netmask\s+(?P<cidr>\S+)\s*$'
+    r'^set\s+(?:(?:device-group\s+(?P<dg>\S+)\s+)|(?:shared\s+))?address\s+(?P<name>\".*?\"|\S+)\s+ip-netmask\s+(?P<cidr>\S+)\s*$',
+    re.IGNORECASE
 )
 ADDR_OBJ_RANGE_RE = re.compile(
-    r'^set\s+(?:device-group\s+(?P<dg>\S+)\s+)?address\s+(?P<name>\".*?\"|\S+)\s+ip-range\s+(?P<start>\S+)\s*-\s*(?P<end>\S+)\s*$'
+    r'^set\s+(?:(?:device-group\s+(?P<dg>\S+)\s+)|(?:shared\s+))?address\s+(?P<name>\".*?\"|\S+)\s+ip-range\s+(?P<start>\S+)\s*-\s*(?P<end>\S+)\s*$',
+    re.IGNORECASE
 )
 
 # Rule member lines. Examples:
