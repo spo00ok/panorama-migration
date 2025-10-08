@@ -203,9 +203,15 @@ def parse_set_config(path):
 
     return addr_objs, rules
 
-def build_reverse_lookup(addr_objs):
+def build_reverse_lookup(addr_objs, name_prefix: str | None):
+    """
+    Build reverse index (value->names) used to find objects to APPEND.
+    If name_prefix is provided, only include address objects whose names start with that prefix.
+    """
     rev = {}
     for name, meta in addr_objs.items():
+        if name_prefix and not name.startswith(name_prefix):
+            continue  # <-- restrict search pool
         if meta["type"] == "ip-netmask":
             net = meta["cidr"]
             key = f'net:{4 if isinstance(net, IPv4Network) else 6}:{net.with_prefixlen}'
@@ -235,6 +241,7 @@ def main():
     ap.add_argument("--mapping", required=True, help="CSV with rows: old,new  (old/new are single IPs or CIDR subnets)")
     ap.add_argument("--emit-scope", choices=["all","pre","post"], default="all", help="Limit to pre/post/all security rules when emitting")
     ap.add_argument("--out", default="rule_edits.set", help="Output file for generated config lines")
+    ap.add_argument("--append-name-prefix", default="svb_host_", help="ONLY search for append candidates among address objects with this name prefix")
     args = ap.parse_args()
 
     mappings = load_map(args.mapping)
@@ -243,7 +250,7 @@ def main():
         return
 
     addr_objs, rules = parse_set_config(args.config)
-    rev = build_reverse_lookup(addr_objs)
+    rev = build_reverse_lookup(addr_objs, args.append_name_prefix)
 
     # Track which sides changed
     changed_sides = set()  # keys of (dg, prepost, rule, which)
@@ -259,7 +266,7 @@ def main():
             existing_order = side["order"]
             existing_seen = side["seen"]
 
-            # If the side is exactly 'any', we skip making a bracketed list to avoid semantic changes.
+            # If the side is exactly 'any', skip to avoid semantic changes.
             if len(existing_order) == 1 and existing_order[0] == "any":
                 continue
 
@@ -311,6 +318,7 @@ def main():
                             if k:
                                 to_lookup_keys.add(k)
 
+                # Look up ONLY among address objects whose names start with args.append_name_prefix
                 for k in to_lookup_keys:
                     obj_names = rev.get(k, set())
                     for obj_name in sorted(obj_names):
@@ -331,12 +339,9 @@ def main():
             for which in ("source", "destination"):
                 if (dg, prepost, rule, which) not in changed_sides:
                     continue
-
                 members = sides[which]["order"]
-                # Re-check the 'any' caveat (we skipped changing those, but be safe)
                 if len(members) == 1 and members[0] == "any":
                     continue
-
                 rule_disp = f'"{rule}"' if (' ' in rule or '"' in rule) else rule
                 bracketed = " ".join(members)
                 outf.write(f'set device-group {dg} {prepost} security rules {rule_disp} {which} [ {bracketed} ]\n')
