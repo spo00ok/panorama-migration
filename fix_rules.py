@@ -11,7 +11,7 @@ RULE_SCOPE_RE = re.compile(
     r'^set\s+device-group\s+(?P<dg>\S+)\s+(?P<prepost>pre-rulebase|post-rulebase)\s+security\s+rules\s+(?P<rule>\".*?\"|\S+)'
 )
 
-# Accepts DG and SHARED ("set shared address ...")
+# Accept DG and SHARED ("set shared address ...")
 ADDR_OBJ_IPNET_RE = re.compile(
     r'^set\s+(?:(?:device-group\s+(?P<dg>\S+)\s+)|(?:shared\s+))?address\s+(?P<name>\".*?\"|\S+)\s+ip-netmask\s+(?P<cidr>\S+)\s*$',
     re.IGNORECASE
@@ -31,9 +31,7 @@ BRACKETS_RE = re.compile(r'^\[\s*(.*?)\s*\]$')
 # --- Helpers ---
 
 def unquote(s: str) -> str:
-    if s and len(s) >= 2 and s[0] == '"' and s[-1] == '"':
-        return s[1:-1]
-    return s
+    return s[1:-1] if s and len(s) >= 2 and s[0] == '"' and s[-1] == '"' else s
 
 def parse_member_values(raw: str):
     raw = raw.strip()
@@ -47,8 +45,8 @@ def load_map(csv_path):
     """
     Returns list of (old_spec, new_spec, type) where type in {"ip","subnet"}.
     Supports:
-      - single IP to single IP
-      - subnet to subnet (host-bit preservation)
+      - single IP -> single IP
+      - subnet -> subnet (host-bit preservation)
     """
     mappings = []
     with open(csv_path, newline='') as f:
@@ -70,7 +68,7 @@ def load_map(csv_path):
                     new_net = ip_network(new_s, strict=False)
                     mappings.append((old_net, new_net, "subnet"))
                 else:
-                    # Mixed IP↔subnet not supported; skip row
+                    # Mixed IP↔subnet not supported; skip
                     continue
             except ValueError:
                 continue
@@ -84,25 +82,21 @@ def iter_addrobj_ips(entry):
             yield list(net.hosts())[0] if net.num_addresses > 2 else net.network_address
         else:
             try:
-                host_iter = net.hosts()
-                first_host = next(host_iter)
+                first_host = next(net.hosts())
                 yield first_host
             except StopIteration:
                 yield net.network_address
     elif t == "ip-range":
-        start = entry["start"]
-        end = entry["end"]
+        start = entry["start"]; end = entry["end"]
         yield start
         if end != start:
             try:
                 if isinstance(start, IPv4Address) and isinstance(end, IPv4Address):
-                    s_int = int(start); e_int = int(end)
-                    mid = IPv4Address((s_int + e_int) // 2)
+                    mid = IPv4Address((int(start) + int(end)) // 2)
                     if mid != start and mid != end:
                         yield mid
                 elif isinstance(start, IPv6Address) and isinstance(end, IPv6Address):
-                    s_int = int(start); e_int = int(end)
-                    mid = IPv6Address((s_int + e_int) // 2)
+                    mid = IPv6Address((int(start) + int(end)) // 2)
                     if mid != start and mid != end:
                         yield mid
             except Exception:
@@ -113,11 +107,10 @@ def convert_ip(old_ip, old_obj, new_obj, map_type):
     if map_type == "ip":
         return new_obj if old_ip == old_obj else None
     elif map_type == "subnet":
-        old_net = old_obj; new_net = new_obj
-        if old_ip in old_net:
-            host_off = int(old_ip) - int(old_net.network_address)
-            if host_off < new_net.num_addresses:
-                return type(new_net.network_address)(int(new_net.network_address) + host_off)
+        if old_ip in old_obj:
+            host_off = int(old_ip) - int(old_obj.network_address)
+            if host_off < new_obj.num_addresses:
+                return type(new_obj.network_address)(int(new_obj.network_address) + host_off)
     return None
 
 def best_match_mapping(ip_or_net_repr, mappings):
@@ -157,9 +150,8 @@ def parse_set_config(path):
                 dg = m.group('dg')
                 scope = dg if dg else 'shared'
                 name = unquote(m.group('name'))
-                cidr = m.group('cidr')
                 try:
-                    net = ip_network(cidr, strict=False)
+                    net = ip_network(m.group('cidr'), strict=False)
                 except ValueError:
                     continue
                 addr_objs[name] = {"scope": scope, "type": "ip-netmask", "cidr": net}
@@ -186,8 +178,7 @@ def parse_set_config(path):
                 prepost = m.group('prepost')
                 rule = unquote(m.group('rule'))
                 which = m.group('which')
-                rawval = m.group('value').strip()
-                members = parse_member_values(rawval)
+                members = parse_member_values(m.group('value').strip())
 
                 key = (dg, prepost, rule)
                 rules.setdefault(key, {
@@ -203,15 +194,15 @@ def parse_set_config(path):
 
     return addr_objs, rules
 
-def build_reverse_lookup(addr_objs, name_prefix: str | None):
+def build_reverse_lookup(addr_objs, name_prefix):
     """
-    Build reverse index (value->names) used to find objects to APPEND.
-    If name_prefix is provided, only include address objects whose names start with that prefix.
+    Reverse index (value->names) for APPEND candidates.
+    If name_prefix is provided, only include names starting with it.
     """
     rev = {}
     for name, meta in addr_objs.items():
         if name_prefix and not name.startswith(name_prefix):
-            continue  # <-- restrict search pool
+            continue
         if meta["type"] == "ip-netmask":
             net = meta["cidr"]
             key = f'net:{4 if isinstance(net, IPv4Network) else 6}:{net.with_prefixlen}'
@@ -221,6 +212,53 @@ def build_reverse_lookup(addr_objs, name_prefix: str | None):
             key = f'range:{ver}:{start}-{end}'
         rev.setdefault(key, set()).add(name)
     return rev
+
+def _space_span(meta):
+    """
+    Normalize an address object's IP space to a comparable span:
+      returns tuple: (version, start_int, end_int)
+    Unifies:
+      - /32 or /128 (single-host) with equivalent single-IP ranges
+      - subnets with equivalent ranges (exact boundary match)
+    """
+    if meta["type"] == "ip-netmask":
+        net = meta["cidr"]
+        start = net.network_address
+        # Last address in the network (works for v4 and v6)
+        last_int = int(net.network_address) + net.num_addresses - 1
+        end = type(start)(last_int)
+        ver = 4 if isinstance(net, IPv4Network) else 6
+        return (ver, int(start), int(end))
+    else:
+        start = meta["start"]; end = meta["end"]
+        ver = 4 if isinstance(start, IPv4Address) else 6
+        return (ver, int(start), int(end))
+
+def dedupe_side_by_ipspace(members_order, addr_objs, rule_ident, which):
+    """
+    Remove later members whose IP space exactly equals an earlier member's IP space.
+    Only applies to tokens that are known address objects (others are left untouched).
+    Returns (new_order, removed_list) where removed_list is [(name, kept_name), ...].
+    """
+    seen_spaces = {}  # key -> kept_name
+    new_order = []
+    removed = []
+    for name in members_order:
+        meta = addr_objs.get(name)
+        if not meta:
+            new_order.append(name)
+            continue
+        key = _space_span(meta)
+        if key in seen_spaces:
+            removed.append((name, seen_spaces[key]))
+            # skip (duplicate IP space)
+        else:
+            seen_spaces[key] = name
+            new_order.append(name)
+    if removed:
+        for dup, kept in removed:
+            print(f'# Dedup {rule_ident} {which}: removed "{dup}" (same IP space as "{kept}")', file=sys.stderr)
+    return new_order, removed
 
 def key_for_ip_or_net(obj):
     if isinstance(obj, (IPv4Address, IPv6Address)):
@@ -236,7 +274,7 @@ def key_for_ip_or_net(obj):
     return None
 
 def main():
-    ap = argparse.ArgumentParser(description="Convert rule address members by old→new mappings and emit full-list bracketed lines.")
+    ap = argparse.ArgumentParser(description="Convert rule address members by old→new mappings, append matching objects, and emit full-list bracketed lines.")
     ap.add_argument("--config", required=True, help="Panorama set-format configuration file")
     ap.add_argument("--mapping", required=True, help="CSV with rows: old,new  (old/new are single IPs or CIDR subnets)")
     ap.add_argument("--emit-scope", choices=["all","pre","post"], default="all", help="Limit to pre/post/all security rules when emitting")
@@ -252,9 +290,10 @@ def main():
     addr_objs, rules = parse_set_config(args.config)
     rev = build_reverse_lookup(addr_objs, args.append_name_prefix)
 
-    # Track which sides changed
-    changed_sides = set()  # keys of (dg, prepost, rule, which)
+    # Track which sides changed (via append or dedupe)
+    changed_sides = set()  # (dg, prepost, rule, which)
 
+    # ------ Phase 1: append candidates after mapping ------
     for (dg, prepost, rule), sides in rules.items():
         if args.emit_scope == "pre" and prepost != "pre-rulebase":
             continue
@@ -270,12 +309,12 @@ def main():
             if len(existing_order) == 1 and existing_order[0] == "any":
                 continue
 
-            # For each member that is an address object, evaluate conversions
             for member in list(existing_order):
                 meta = addr_objs.get(member)
                 if not meta:
-                    continue  # not a known address object (could be address-group/FQDN, etc.)
+                    continue  # unknown token (group/FQDN/etc.)
 
+                # Find an applicable mapping based on representative IP(s)
                 rep_ips = list(iter_addrobj_ips(meta))
                 applied_mapping = None
                 for rep_ip in rep_ips:
@@ -300,6 +339,7 @@ def main():
                                 to_lookup_keys.add(k)
                     else:
                         if t == "subnet":
+                            # Translate the network address and try to keep same prefixlen
                             if net.network_address in old_obj or net.subnet_of(old_obj):
                                 trans_net_addr = convert_ip(net.network_address, old_obj, new_obj, t)
                                 if trans_net_addr:
@@ -318,16 +358,41 @@ def main():
                             if k:
                                 to_lookup_keys.add(k)
 
-                # Look up ONLY among address objects whose names start with args.append_name_prefix
+                # Only append objects whose names start with the given prefix (via rev index)
+                appended_here = False
                 for k in to_lookup_keys:
-                    obj_names = rev.get(k, set())
-                    for obj_name in sorted(obj_names):
+                    for obj_name in sorted(rev.get(k, set())):
                         if obj_name not in existing_seen:
                             existing_order.append(obj_name)
                             existing_seen.add(obj_name)
-                            changed_sides.add((dg, prepost, rule, which))
+                            appended_here = True
+                if appended_here:
+                    changed_sides.add((dg, prepost, rule, which))
 
-    # Emit full-list bracketed lines for modified sides only
+    # ------ Phase 2: dedupe equal IP spaces within each side ------
+    for (dg, prepost, rule), sides in rules.items():
+        if args.emit_scope == "pre" and prepost != "pre-rulebase":
+            continue
+        if args.emit_scope == "post" and prepost != "post-rulebase":
+            continue
+
+        for which in ("source", "destination"):
+            side = sides[which]
+            members = side["order"]
+
+            # Skip semantic 'any'
+            if len(members) == 1 and members[0] == "any":
+                continue
+
+            before = list(members)
+            rule_ident = f'device-group {dg} {prepost} rules "{rule}"'
+            deduped, removed = dedupe_side_by_ipspace(before, addr_objs, rule_ident, which)
+            if deduped != before:
+                side["order"] = deduped
+                side["seen"] = set(deduped)
+                changed_sides.add((dg, prepost, rule, which))
+
+    # ------ Emit full-list bracketed lines for modified sides only ------
     out_path = args.out
     with open(out_path, 'w', encoding='utf-8') as outf:
         for (dg, prepost, rule), sides in rules.items():
@@ -349,7 +414,7 @@ def main():
     if not changed_sides:
         print("# No rule sides required edits; nothing written.", file=sys.stderr)
     else:
-        print(f'# Wrote edits for {len(changed_sides)} rule side(s) to: {out_path}')
+        print(f'# Wrote edits for {len(changed_sides)} rule side(s) to: {out_path}', file=sys.stderr)
 
 if __name__ == "__main__":
     main()
