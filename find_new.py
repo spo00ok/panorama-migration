@@ -8,6 +8,17 @@ from ipaddress import (
     IPv4Network, IPv6Network, IPv4Address, IPv6Address
 )
 
+'''
+python panorama_convert_create_and_append.py \
+  --config panorama.set \
+  --mapping ip_migration.csv \
+  --out-rules rule_edits.set \
+  --out-creates object_creates.set \
+  --log rule_edits.log \
+  --emit-scope all
+'''
+
+
 # ---------- Regexes ----------
 
 # Address objects (DG or shared)
