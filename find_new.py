@@ -219,3 +219,246 @@ def convert_with_mapping(ip, kind, old_obj, new_obj):
     if kind == "range_ip":
         return new_obj
     if kind == "range_subnet":
+        start, _ = old_obj
+        off = int(ip) - int(start)
+        if off < new_obj.num_addresses:
+            return type(new_obj.network_address)(int(new_obj.network_address) + off)
+    return None
+
+# --------------- Parse config ----------------
+def parse_config():
+    addr_objs = {}
+    rules = {}
+    with open(CONFIG_FILE, "r", encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            s = raw.strip()
+            if not s or not s.startswith("set "):
+                continue
+
+            m = ADDR_OBJ_IPNET_RE.match(s)
+            if m:
+                scope = m.group("dg") if m.group("dg") else "shared"
+                name  = unquote(m.group("name"))
+                try:
+                    net = ip_network(m.group("cidr"), strict=False)
+                except ValueError:
+                    continue
+                addr_objs[name] = {"scope": scope, "type": "ip-netmask", "cidr": net}
+                continue
+
+            m = ADDR_OBJ_RANGE_RE.match(s)
+            if m:
+                scope = m.group("dg") if m.group("dg") else "shared"
+                name  = unquote(m.group("name"))
+                try:
+                    start = ip_address(m.group("start"))
+                    end   = ip_address(m.group("end"))
+                    if type(start) is not type(end) or int(end) < int(start):
+                        continue
+                except ValueError:
+                    continue
+                addr_objs[name] = {"scope": scope, "type": "ip-range", "start": start, "end": end}
+                continue
+
+            m = RULE_MEMBER_RE.match(s)
+            if m:
+                dg      = m.group("dg")
+                prepost = m.group("prepost")
+                rule    = unquote(m.group("rule"))
+                which   = m.group("which")
+                values  = parse_member_values(m.group("value"))
+                key = (dg, prepost, rule)
+                rules.setdefault(key, {
+                    "source": {"order": [], "seen": set()},
+                    "destination": {"order": [], "seen": set()},
+                })
+                side = rules[key][which]
+                for v in values:
+                    if v not in side["seen"]:
+                        side["order"].append(v)
+                        side["seen"].add(v)
+                continue
+    return addr_objs, rules
+
+# --------------- Main flow ----------------
+def main():
+    if not os.path.exists(CONFIG_FILE):
+        print(f"Config file {CONFIG_FILE} not found.")
+        return
+
+    one_to_one, networks, ranges = load_translation()
+    addr_objs, rules = parse_config()
+
+    # Reverse index for EXACT hosts and EXACT subnets
+    rev = {}
+    for name, meta in addr_objs.items():
+        if meta["type"] == "ip-netmask":
+            net = meta["cidr"]
+            key = key_for_exact_net(net)
+            rev.setdefault(key, set()).add(name)
+            # also index host nets (/32,/128) under host key
+            if (isinstance(net, IPv4Network) and net.prefixlen == 32) or (isinstance(net, IPv6Network) and net.prefixlen == 128):
+                hkey = key_for_exact_host(net.network_address)
+                rev.setdefault(hkey, set()).add(name)
+        else:
+            # ranges not used for exact equality lookups
+            pass
+
+    created = []       # (name, cidr_text)
+    changed_sides = set()  # (dg, prepost, rule, which)
+    log_lines = []
+
+    for (dg, prepost, rule), sides in rules.items():
+        for which in ("source", "destination"):
+            members = sides[which]["order"]
+            seen    = sides[which]["seen"]
+
+            if len(members) == 1 and members[0] == "any":
+                continue
+
+            altered = False
+
+            for name in list(members):
+                meta = addr_objs.get(name)
+                if not meta:
+                    continue
+
+                # --- Case A: subnet objects (non-host) should map to a NEW SUBNET object ---
+                if meta["type"] == "ip-netmask":
+                    net = meta["cidr"]
+                    is_host = (isinstance(net, IPv4Network) and net.prefixlen == 32) or (isinstance(net, IPv6Network) and net.prefixlen == 128)
+                    if not is_host:
+                        # Determine subnet mapping by converting the network address with host-offset 0
+                        # using any applicable mapping (most-specific subnet wins).
+                        m = best_mapping_for_ip(net.network_address, one_to_one, networks, ranges)
+                        if m and m[0] in ("subnet", "range_subnet"):
+                            kind, old_obj, new_obj = m
+                            # map network base, then keep same prefixlen as the MEMBER
+                            new_base = convert_with_mapping(net.network_address, kind, old_obj, new_obj)
+                            if new_base:
+                                try:
+                                    mapped_net = ip_network(f"{new_base}/{net.prefixlen}", strict=False)
+                                except ValueError:
+                                    mapped_net = None
+                                if mapped_net:
+                                    # If exact subnet already present in side, skip
+                                    net_key = key_for_exact_net(mapped_net)
+                                    # If a member already equals mapped_net, 'seen' may not include it unless by name; check by names via rev
+                                    candidates = rev.get(net_key, set())
+                                    chosen = choose_existing_object(candidates, addr_objs)
+
+                                    if chosen:
+                                        if chosen not in seen:
+                                            members.append(chosen)
+                                            seen.add(chosen)
+                                            altered = True
+                                            log_lines.append(
+                                                f'Edited: device-group {dg} {prepost} rule "{rule}" {which}: appended EXISTING subnet {chosen} = {mapped_net.with_prefixlen}'
+                                            )
+                                    else:
+                                        # create shared subnet object svb_net_X_X_X_X_P
+                                        base = net_name_for(mapped_net)
+                                        name_new = unique_name(base, addr_objs)
+                                        cidr_text = mapped_net.with_prefixlen
+                                        addr_objs[name_new] = {"scope": "shared", "type": "ip-netmask", "cidr": mapped_net}
+                                        rev.setdefault(net_key, set()).add(name_new)
+                                        members.append(name_new)
+                                        seen.add(name_new)
+                                        altered = True
+                                        created.append((name_new, cidr_text))
+                                        log_lines.append(
+                                            f'Edited: device-group {dg} {prepost} rule "{rule}" {which}: CREATED and appended subnet {name_new} = {cidr_text}'
+                                        )
+                        # continue; still allow host-path below for completeness
+
+                # --- Case B: host-path (as before) ---
+                for rep in iter_rep_ips_for_obj(meta):
+                    m = best_mapping_for_ip(rep, one_to_one, networks, ranges)
+                    if not m:
+                        continue
+                    kind, old_obj, new_obj = m
+                    new_ip = convert_with_mapping(rep, kind, old_obj, new_obj)
+                    if not new_ip:
+                        continue
+                    if side_covers_ip(members, addr_objs, new_ip):
+                        continue
+
+                    hkey = key_for_exact_host(new_ip)
+                    cand = choose_existing_object(rev.get(hkey, set()), addr_objs)
+                    if cand and (cand not in seen):
+                        members.append(cand)
+                        seen.add(cand)
+                        altered = True
+                        log_lines.append(
+                            f'Edited: device-group {dg} {prepost} rule "{rule}" {which}: appended EXISTING host {cand} = {new_ip}'
+                        )
+                        continue
+
+                    # create shared host object
+                    base = host_name_for(new_ip)
+                    name_new = unique_name(base, addr_objs)
+                    cidr_text = f"{new_ip}/32" if isinstance(new_ip, IPv4Address) else f"{new_ip}/128"
+                    new_net = ip_network(cidr_text, strict=False)
+                    addr_objs[name_new] = {"scope": "shared", "type": "ip-netmask", "cidr": new_net}
+                    rev.setdefault(hkey, set()).add(name_new)
+                    # also index under net key for completeness
+                    rev.setdefault(key_for_exact_net(new_net), set()).add(name_new)
+
+                    members.append(name_new)
+                    seen.add(name_new)
+                    altered = True
+                    created.append((name_new, cidr_text))
+                    log_lines.append(
+                        f'Edited: device-group {dg} {prepost} rule "{rule}" {which}: CREATED and appended host {name_new} = {cidr_text}'
+                    )
+
+            # Dedupe exact IP space
+            if members:
+                deduped, removed = dedupe_side_by_ipspace(members, addr_objs)
+                if deduped != members:
+                    sides[which]["order"] = deduped
+                    sides[which]["seen"]  = set(deduped)
+                    altered = True
+                    for dup, kept in removed:
+                        log_lines.append(
+                            f'Dedup: device-group {dg} {prepost} rule "{rule}" {which}: removed "{dup}" (same IP space as "{kept}")'
+                        )
+
+            if altered:
+                changed_sides.add((dg, prepost, rule, which))
+
+    # -------- Outputs --------
+    # 1) Full bracketed lines for changed sides
+    with open(OUT_RULE_EDITS, "w", encoding="utf-8") as outf:
+        for (dg, prepost, rule), sides in rules.items():
+            for which in ("source", "destination"):
+                if (dg, prepost, rule, which) not in changed_sides:
+                    continue
+                members = sides[which]["order"]
+                if len(members) == 1 and members[0] == "any":
+                    continue
+                rule_disp = f'"{rule}"' if (' ' in rule or '"' in rule) else rule
+                outf.write(
+                    f'set device-group {dg} {prepost} security rules {rule_disp} {which} [ {" ".join(members)} ]\n'
+                )
+
+    # 2) Creation lines (shared)
+    with open(OUT_OBJ_CREATES, "w", encoding="utf-8") as outf:
+        for name, cidr_text in created:
+            outf.write(f'set shared address {name} ip-netmask {cidr_text}\n')
+
+    # 3) Log
+    with open(LOG_FILE, "w", encoding="utf-8") as lf:
+        if not changed_sides:
+            lf.write("No security rule sides required edits based on provided mappings.\n")
+        else:
+            lf.write(f"Rule sides modified: {len(changed_sides)}\n")
+            for line in log_lines:
+                lf.write(line + "\n")
+
+    print(f"✅ Wrote rule edits to {OUT_RULE_EDITS}")
+    print(f"✅ Wrote {len(created)} shared object create lines to {OUT_OBJ_CREATES}")
+    print(f"✅ Log written to {LOG_FILE}")
+
+if __name__ == "__main__":
+    main()
