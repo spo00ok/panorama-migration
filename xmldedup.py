@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 """
-panorama_xml_dedupe_addresses.py
+panorama_xml_dedupe_addresses_auto.py
 
 Parse a Panorama XML config export, find duplicate address objects with the same
-value, find references in address-groups / security rules / NAT rules, and let
-you choose which object to keep.
+value, find references in address-groups / security rules / NAT rules, and
+automatically choose which object to keep based on naming preference.
 
-Also writes a CSV report of all duplicate groups and their references.
+Keeper preference order:
+1. "<value>_<hostname>"         e.g. 10.1.1.1_mysystemhostname.dev.domain
+2. "SVB_<value>"                e.g. SVB_10.1.1.1
+3. names starting with svb_host_
+4. fallback:
+   - shared preferred over device-group
+   - more references preferred
+   - shorter name preferred
+   - alphabetical
 
 Supports:
 - shared address objects
@@ -22,9 +30,10 @@ References updated in:
 - NAT rules (source/destination, translated-address fields when they reference objects)
 
 Usage:
-    python panorama_xml_dedupe_addresses.py -i panorama.xml -o panorama_deduped.xml
-    python panorama_xml_dedupe_addresses.py -i panorama.xml -o panorama_deduped.xml --delete-replaced
-    python panorama_xml_dedupe_addresses.py -i panorama.xml -o panorama_deduped.xml --csv-report duplicates_report.csv
+    python panorama_xml_dedupe_addresses_auto.py -i panorama.xml -o panorama_deduped.xml
+    python panorama_xml_dedupe_addresses_auto.py -i panorama.xml -o panorama_deduped.xml --delete-replaced
+    python panorama_xml_dedupe_addresses_auto.py -i panorama.xml -o panorama_deduped.xml --csv-report duplicates_report.csv
+    python panorama_xml_dedupe_addresses_auto.py -i panorama.xml -o panorama_deduped.xml --decision-csv decisions.csv
 
 Notes:
 - This is for Panorama XML export, not "set" format.
@@ -34,6 +43,7 @@ Notes:
 
 import argparse
 import csv
+import re
 import sys
 import xml.etree.ElementTree as ET
 from collections import defaultdict
@@ -56,9 +66,7 @@ class AddressObject:
     parent_elem: ET.Element
 
     def scope_label(self) -> str:
-        if self.scope_type == "shared":
-            return "shared"
-        return f"device-group:{self.scope_name}"
+        return "shared" if self.scope_type == "shared" else f"device-group:{self.scope_name}"
 
     def key(self) -> Tuple[str, str]:
         return (self.obj_type, self.value)
@@ -71,13 +79,11 @@ class Reference:
     scope_name: str
     container_name: str    # group/rule name
     field_name: str        # source / destination / member / translated-address
-    elem: ET.Element       # element whose text is the object name
+    elem: ET.Element
     xml_path: str
 
     def scope_label(self) -> str:
-        if self.scope_type == "shared":
-            return "shared"
-        return f"device-group:{self.scope_name}"
+        return "shared" if self.scope_type == "shared" else f"device-group:{self.scope_name}"
 
 
 # ----------------------------
@@ -91,9 +97,9 @@ def indent(elem: ET.Element, level: int = 0) -> None:
             elem.text = i + "  "
         for child in elem:
             indent(child, level + 1)
-        if not child.tail or not child.tail.strip():
+        if child.tail is None or not child.tail.strip():
             child.tail = i
-    if level and (not elem.tail or not elem.tail.strip()):
+    if level and (elem.tail is None or not elem.tail.strip()):
         elem.tail = i
 
 
@@ -131,16 +137,16 @@ def extract_address_value(addr_entry: ET.Element) -> Optional[Tuple[str, str]]:
 
 
 def find_shared_address_objects(root: ET.Element) -> List[AddressObject]:
-    objs = []
+    objs: List[AddressObject] = []
     for shared in root.findall(".//shared"):
         addr_parent = shared.find("address")
         if addr_parent is None:
             continue
         for entry in addr_parent.findall("entry"):
-            v = extract_address_value(entry)
-            if not v:
+            result = extract_address_value(entry)
+            if result is None:
                 continue
-            obj_type, value = v
+            obj_type, value = result
             objs.append(
                 AddressObject(
                     name=entry_name(entry),
@@ -156,17 +162,17 @@ def find_shared_address_objects(root: ET.Element) -> List[AddressObject]:
 
 
 def find_dg_address_objects(root: ET.Element) -> List[AddressObject]:
-    objs = []
+    objs: List[AddressObject] = []
     for dg in root.findall(".//devices/entry/device-group/entry"):
         dg_name = entry_name(dg)
         addr_parent = dg.find("address")
         if addr_parent is None:
             continue
         for entry in addr_parent.findall("entry"):
-            v = extract_address_value(entry)
-            if not v:
+            result = extract_address_value(entry)
+            if result is None:
                 continue
-            obj_type, value = v
+            obj_type, value = result
             objs.append(
                 AddressObject(
                     name=entry_name(entry),
@@ -203,12 +209,11 @@ def get_scope_from_ancestor(elem: ET.Element, parent_map: Dict[ET.Element, ET.El
 
 
 def collect_address_group_references(root: ET.Element, parent_map: Dict[ET.Element, ET.Element]) -> Dict[str, List[Reference]]:
-    refs = defaultdict(list)
+    refs: Dict[str, List[Reference]] = defaultdict(list)
 
     for ag_entry in root.findall(".//address-group/entry"):
         ag_name = entry_name(ag_entry)
         scope_type, scope_name = get_scope_from_ancestor(ag_entry, parent_map)
-
         static = ag_entry.find("static")
         if static is None:
             continue
@@ -231,7 +236,7 @@ def collect_address_group_references(root: ET.Element, parent_map: Dict[ET.Eleme
 
 
 def collect_security_rule_references(root: ET.Element, parent_map: Dict[ET.Element, ET.Element]) -> Dict[str, List[Reference]]:
-    refs = defaultdict(list)
+    refs: Dict[str, List[Reference]] = defaultdict(list)
 
     rule_paths = [
         ".//pre-rulebase/security/rules/entry",
@@ -266,7 +271,7 @@ def collect_security_rule_references(root: ET.Element, parent_map: Dict[ET.Eleme
 
 
 def collect_nat_rule_references(root: ET.Element, parent_map: Dict[ET.Element, ET.Element]) -> Dict[str, List[Reference]]:
-    refs = defaultdict(list)
+    refs: Dict[str, List[Reference]] = defaultdict(list)
 
     rule_paths = [
         ".//pre-rulebase/nat/rules/entry",
@@ -324,7 +329,7 @@ def collect_nat_rule_references(root: ET.Element, parent_map: Dict[ET.Element, E
 
 
 def merge_reference_maps(*maps: Dict[str, List[Reference]]) -> Dict[str, List[Reference]]:
-    merged = defaultdict(list)
+    merged: Dict[str, List[Reference]] = defaultdict(list)
     for m in maps:
         for k, v in m.items():
             merged[k].extend(v)
@@ -346,6 +351,92 @@ def can_replace_reference_with_target(ref: Reference, target_obj: AddressObject)
         return False
 
     return False
+
+
+# ----------------------------
+# Name preference / keeper selection
+# ----------------------------
+
+def is_ip_value_name(name: str, value: str) -> bool:
+    """
+    Preferred format: <value>_<something>
+    Example: 10.1.1.1_mysystemhostname.dev.domain
+    """
+    return name.startswith(value + "_") and len(name) > len(value) + 1
+
+
+def is_svb_exact_name(name: str, value: str) -> bool:
+    """
+    Second preference: SVB_<value>
+    Example: SVB_10.1.1.1
+    """
+    return name == f"SVB_{value}"
+
+
+def is_svb_host_name(name: str) -> bool:
+    """
+    Lowest preference: starts with svb_host_
+    """
+    return name.startswith("svb_host_")
+
+
+def name_preference_rank(obj: AddressObject) -> int:
+    """
+    Lower is better.
+    0 = <value>_<hostname>
+    1 = SVB_<value>
+    2 = everything else
+    3 = svb_host_*
+    """
+    if is_ip_value_name(obj.name, obj.value):
+        return 0
+    if is_svb_exact_name(obj.name, obj.value):
+        return 1
+    if is_svb_host_name(obj.name):
+        return 3
+    return 2
+
+
+def scope_rank(obj: AddressObject) -> int:
+    return 0 if obj.scope_type == "shared" else 1
+
+
+def choose_keeper_auto(
+    dup_group: List[AddressObject],
+    refs_by_name: Dict[str, List[Reference]],
+) -> AddressObject:
+    """
+    Automatically choose keeper using:
+    1. preferred naming rank
+    2. shared over device-group
+    3. higher reference count
+    4. shorter name
+    5. alphabetical
+    """
+    def sort_key(obj: AddressObject) -> Tuple[int, int, int, int, str]:
+        ref_count = len(refs_by_name.get(obj.name, []))
+        return (
+            name_preference_rank(obj),
+            scope_rank(obj),
+            -ref_count,
+            len(obj.name),
+            obj.name.lower(),
+        )
+
+    return sorted(dup_group, key=sort_key)[0]
+
+
+def describe_keeper_reason(obj: AddressObject, refs_by_name: Dict[str, List[Reference]]) -> str:
+    rank = name_preference_rank(obj)
+    ref_count = len(refs_by_name.get(obj.name, []))
+
+    if rank == 0:
+        return f"preferred name format <value>_<hostname>; refs={ref_count}; scope={obj.scope_label()}"
+    if rank == 1:
+        return f"preferred name format SVB_<value>; refs={ref_count}; scope={obj.scope_label()}"
+    if rank == 3:
+        return f"lowest-priority svb_host_ fallback won by other tie-breakers; refs={ref_count}; scope={obj.scope_label()}"
+    return f"fallback selection; refs={ref_count}; scope={obj.scope_label()}"
 
 
 # ----------------------------
@@ -426,61 +517,29 @@ def write_csv_report(
             group_id += 1
 
 
-# ----------------------------
-# Interactive selection
-# ----------------------------
-
-def summarize_refs(refs: List[Reference]) -> Dict[str, int]:
-    counts = defaultdict(int)
-    for r in refs:
-        counts[r.ref_type] += 1
-    return dict(counts)
-
-
-def print_reference_details(refs: List[Reference], max_show: int = 20) -> None:
-    if not refs:
-        print("      No references found.")
-        return
-
-    for idx, r in enumerate(refs[:max_show], 1):
-        print(
-            f"      {idx:2d}. [{r.ref_type}] {r.scope_label()} "
-            f"{r.container_name} :: {r.field_name} :: {r.xml_path}"
+def write_decision_csv(
+    csv_path: str,
+    decisions: List[Dict[str, str]],
+) -> None:
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "object_type",
+                "object_value",
+                "kept_name",
+                "kept_scope",
+                "kept_reason",
+                "replaced_name",
+                "replaced_scope",
+                "replaced_refs_rewritten",
+                "replaced_refs_skipped",
+                "deleted",
+            ],
         )
-    if len(refs) > max_show:
-        print(f"      ... {len(refs) - max_show} more")
-
-
-def choose_keeper(
-    dup_group: List[AddressObject],
-    refs_by_name: Dict[str, List[Reference]],
-) -> Optional[AddressObject]:
-    print("\n" + "=" * 100)
-    print(f"Duplicate value group: type={dup_group[0].obj_type!r} value={dup_group[0].value!r}")
-    print("=" * 100)
-
-    for i, obj in enumerate(dup_group, 1):
-        refs = refs_by_name.get(obj.name, [])
-        ref_summary = summarize_refs(refs)
-        print(f"{i}. {obj.name}  [{obj.scope_label()}]")
-        print(f"   refs={len(refs)} summary={ref_summary if ref_summary else '{}'}")
-        print_reference_details(refs, max_show=10)
-        print()
-
-    print("Choose the object to KEEP for this duplicate group.")
-    print("Options:")
-    print("  number = keep that object and replace what can safely be replaced")
-    print("  s      = skip this duplicate group")
-
-    while True:
-        choice = input("Selection: ").strip().lower()
-        if choice == "s":
-            return None
-        if choice.isdigit():
-            n = int(choice)
-            if 1 <= n <= len(dup_group):
-                return dup_group[n - 1]
-        print("Invalid selection.")
+        writer.writeheader()
+        for row in decisions:
+            writer.writerow(row)
 
 
 # ----------------------------
@@ -520,11 +579,12 @@ def delete_object_if_safe(obj: AddressObject, refs_by_name: Dict[str, List[Refer
 # ----------------------------
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Deduplicate address objects in a Panorama XML export.")
+    parser = argparse.ArgumentParser(description="Automatically deduplicate address objects in a Panorama XML export.")
     parser.add_argument("-i", "--input", required=True, help="Input Panorama XML file")
     parser.add_argument("-o", "--output", required=True, help="Output XML file")
     parser.add_argument("--delete-replaced", action="store_true", help="Delete duplicate address objects that are fully replaced and no longer referenced")
     parser.add_argument("--csv-report", help="Write duplicate/reference report to this CSV file")
+    parser.add_argument("--decision-csv", help="Write replacement decisions to this CSV file")
     args = parser.parse_args()
 
     try:
@@ -547,7 +607,7 @@ def main() -> int:
         collect_nat_rule_references(root, parent_map),
     )
 
-    by_value = defaultdict(list)
+    by_value: Dict[Tuple[str, str], List[AddressObject]] = defaultdict(list)
     for obj in objects:
         by_value[obj.key()].append(obj)
 
@@ -569,14 +629,18 @@ def main() -> int:
     total_replaced = 0
     total_skipped = 0
     total_deleted = 0
+    decisions: List[Dict[str, str]] = []
 
     for group in sorted(dup_groups, key=lambda g: (g[0].obj_type, g[0].value)):
-        keeper = choose_keeper(group, refs_by_name)
-        if keeper is None:
-            print("Skipped.")
-            continue
+        keeper = choose_keeper_auto(group, refs_by_name)
+        reason = describe_keeper_reason(keeper, refs_by_name)
 
-        print(f"Keeping: {keeper.name} [{keeper.scope_label()}]")
+        print("\n" + "=" * 100)
+        print(f"Duplicate group: type={group[0].obj_type!r} value={group[0].value!r}")
+        print(f"Keeping: {keeper.name} [{keeper.scope_label()}] -- {reason}")
+
+        for obj in sorted(group, key=lambda x: (x is keeper, x.scope_type, x.scope_name, x.name)):
+            print(f"  candidate: {obj.name} [{obj.scope_label()}] refs={len(refs_by_name.get(obj.name, []))}")
 
         for obj in group:
             if obj is keeper:
@@ -596,21 +660,36 @@ def main() -> int:
                 refs_by_name[obj.name] = remaining_old_refs
                 refs_by_name[keeper.name].extend(new_refs)
 
+            deleted = False
+            if args.delete_replaced:
+                deleted = delete_object_if_safe(obj, refs_by_name)
+                if deleted:
+                    total_deleted += 1
+
+            decisions.append({
+                "object_type": group[0].obj_type,
+                "object_value": group[0].value,
+                "kept_name": keeper.name,
+                "kept_scope": keeper.scope_label(),
+                "kept_reason": reason,
+                "replaced_name": obj.name,
+                "replaced_scope": obj.scope_label(),
+                "replaced_refs_rewritten": str(replaced),
+                "replaced_refs_skipped": str(skipped),
+                "deleted": "yes" if deleted else "no",
+            })
+
             total_replaced += replaced
             total_skipped += skipped
 
             print(
                 f"  {obj.name} [{obj.scope_label()}] -> {keeper.name} "
-                f"(replaced={replaced}, skipped={skipped})"
+                f"(replaced={replaced}, skipped={skipped}, deleted={'yes' if deleted else 'no'})"
             )
 
-            if args.delete_replaced:
-                deleted = delete_object_if_safe(obj, refs_by_name)
-                if deleted:
-                    total_deleted += 1
-                    print(f"    deleted duplicate object: {obj.name}")
-                else:
-                    print(f"    not deleted (still referenced, or delete failed): {obj.name}")
+    if args.decision_csv:
+        write_decision_csv(args.decision_csv, decisions)
+        print(f"\nWrote decision CSV: {args.decision_csv}")
 
     indent(root)
     tree.write(args.output, encoding="utf-8", xml_declaration=True)
